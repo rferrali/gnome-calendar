@@ -24,6 +24,12 @@
 
 G_BEGIN_DECLS
 
+GHashTable*          gcal_rsvp_dup_user_addresses                (GcalManager               *manager,
+                                                                  GcalCalendar              *calendar);
+
+gboolean             gcal_rsvp_is_user_address                   (GHashTable                *addresses,
+                                                                  const gchar               *address);
+
 gboolean             gcal_rsvp_get_user_status                   (GcalManager               *manager,
                                                                   GcalEvent                 *event,
                                                                   GcalEventAttendeePartStat *out_status,
@@ -40,5 +46,9 @@ void                 gcal_rsvp_respond                           (GcalManager   
 
 gboolean             gcal_rsvp_respond_finish                    (GAsyncResult              *result,
                                                                   GError                   **error);
+
+GcalEvent*           gcal_rsvp_dup_event_with_user_status        (GcalManager               *manager,
+                                                                  GcalEvent                 *event,
+                                                                  GcalEventAttendeePartStat  status);
 
 G_END_DECLS

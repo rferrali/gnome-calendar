@@ -23,7 +23,12 @@
 #include "gcal-calendar.h"
 #include "gcal-debug.h"
 #include "gcal-event-popover.h"
+#include "gcal-guest-list.h"
 #include "gcal-meeting-row.h"
+#include "gcal-rsvp.h"
+#include "gcal-rsvp-box.h"
+#include "gcal-application.h"
+#include "gcal-context.h"
 #include "gcal-utils.h"
 
 #include <glib/gi18n.h>
@@ -43,6 +48,14 @@ struct _GcalEventPopover
   GtkLabel           *placeholder_label;
   GtkLabel           *summary_label;
   GtkImage           *read_only_icon;
+
+  /* Fork: invitations */
+  GtkWidget          *rsvp_container;
+  GcalRsvpBox        *rsvp_box;
+  GtkLabel           *rsvp_status_label;
+  GtkWidget          *guests_box;
+  GtkLabel           *guests_summary_label;
+  GcalGuestList      *guest_list;
 
   GcalEvent          *event;
 };
@@ -520,7 +533,36 @@ set_event_internal (GcalEventPopover *self,
   update_date_time_label (self);
   update_decorations (self, event);
 
+  /* Fork: invitations */
+  gcal_rsvp_box_set_event (self->rsvp_box, event);
+  gcal_guest_list_set_event (self->guest_list, event);
+  gtk_widget_set_visible (self->guests_box, gcal_guest_list_get_n_guests (self->guest_list) > 0);
+
   gtk_widget_grab_focus (self->action_button);
+}
+
+/* Fork: invitations */
+static void
+on_rsvp_responded_cb (GcalRsvpBox      *rsvp_box,
+                      gint              status,
+                      GcalEventPopover *self)
+{
+  g_autoptr (GcalEvent) updated = NULL;
+  GcalManager *manager;
+
+  /* Exchange removes a declined meeting from the calendar */
+  if (status == GCAL_EVENT_ATTENDEE_PART_DECLINED)
+    {
+      gtk_popover_popdown (GTK_POPOVER (self));
+      return;
+    }
+
+  /* Show the new reply in the guest list right away */
+  manager = gcal_context_get_manager (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+  updated = gcal_rsvp_dup_event_with_user_status (manager, self->event, status);
+
+  if (updated)
+    gcal_guest_list_set_event (self->guest_list, updated);
 }
 
 
@@ -793,6 +835,17 @@ gcal_event_popover_class_init (GcalEventPopoverClass *klass)
   gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, summary_label);
   gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, read_only_icon);
 
+  g_type_ensure (GCAL_TYPE_RSVP_BOX);
+  g_type_ensure (GCAL_TYPE_GUEST_LIST);
+
+  gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, rsvp_container);
+  gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, rsvp_box);
+  gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, rsvp_status_label);
+  gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, guests_box);
+  gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, guests_summary_label);
+  gtk_widget_class_bind_template_child (widget_class, GcalEventPopover, guest_list);
+
+  gtk_widget_class_bind_template_callback (widget_class, on_rsvp_responded_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_action_button_clicked_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_ics_export_button_clicked_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_map_button_clicked_cb);
@@ -804,6 +857,11 @@ gcal_event_popover_init (GcalEventPopover *self)
   GcalContext *context = gcal_application_get_context (GCAL_DEFAULT_APPLICATION);
 
   gtk_widget_init_template (GTK_WIDGET (self));
+
+  /* Fork: invitations */
+  g_object_bind_property (self->rsvp_box, "can-respond", self->rsvp_container, "visible", G_BINDING_SYNC_CREATE);
+  g_object_bind_property (self->rsvp_box, "status-text", self->rsvp_status_label, "label", G_BINDING_SYNC_CREATE);
+  g_object_bind_property (self->guest_list, "summary", self->guests_summary_label, "label", G_BINDING_SYNC_CREATE);
 
   g_signal_connect_object (context,
                            "notify::time-format",

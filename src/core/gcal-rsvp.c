@@ -38,6 +38,7 @@
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (ICalComponent, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (ICalProperty, g_object_unref)
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (ICalParameter, g_object_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (ECalComponent, g_object_unref)
 
 typedef struct
 {
@@ -73,9 +74,9 @@ add_address (GHashTable  *addresses,
  * (cal-email-address, e.g. the Exchange account address), plus every mail
  * identity address and alias.
  */
-static GHashTable *
-dup_user_addresses (GcalManager  *manager,
-                    GcalCalendar *calendar)
+GHashTable *
+gcal_rsvp_dup_user_addresses (GcalManager  *manager,
+                              GcalCalendar *calendar)
 {
   g_autolist (ESource) identities = NULL;
   ESourceRegistry *registry;
@@ -113,9 +114,9 @@ dup_user_addresses (GcalManager  *manager,
   return addresses;
 }
 
-static gboolean
-is_user_address (GHashTable  *addresses,
-                 const gchar *address)
+gboolean
+gcal_rsvp_is_user_address (GHashTable  *addresses,
+                           const gchar *address)
 {
   g_autofree gchar *lower = NULL;
 
@@ -136,7 +137,7 @@ user_is_organizer (ICalComponent *icomp,
 
   organizer = i_cal_component_get_first_property (icomp, I_CAL_ORGANIZER_PROPERTY);
 
-  return organizer && is_user_address (addresses, i_cal_property_get_organizer (organizer));
+  return organizer && gcal_rsvp_is_user_address (addresses, i_cal_property_get_organizer (organizer));
 }
 
 /* Returns: (transfer full) (nullable): the user's ATTENDEE property of @icomp */
@@ -150,7 +151,7 @@ find_user_attendee (ICalComponent *icomp,
        prop;
        g_object_unref (prop), prop = i_cal_component_get_next_property (icomp, I_CAL_ATTENDEE_PROPERTY))
     {
-      if (is_user_address (addresses, i_cal_property_get_attendee (prop)))
+      if (gcal_rsvp_is_user_address (addresses, i_cal_property_get_attendee (prop)))
         return prop;
     }
 
@@ -352,7 +353,7 @@ gcal_rsvp_get_user_status (GcalManager               *manager,
     return FALSE;
 
   icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
-  addresses = dup_user_addresses (manager, gcal_event_get_calendar (event));
+  addresses = gcal_rsvp_dup_user_addresses (manager, gcal_event_get_calendar (event));
 
   if (user_is_organizer (icomp, addresses))
     return FALSE;
@@ -405,7 +406,7 @@ gcal_rsvp_respond (GcalManager               *manager,
   data = g_new0 (RespondData, 1);
   data->calendar = g_object_ref (gcal_event_get_calendar (event));
   data->icomp = i_cal_component_clone (e_cal_component_get_icalcomponent (gcal_event_get_component (event)));
-  data->user_addresses = dup_user_addresses (manager, data->calendar);
+  data->user_addresses = gcal_rsvp_dup_user_addresses (manager, data->calendar);
   data->whole_series = whole_series;
   data->notify_organizer = notify_organizer;
 
@@ -429,6 +430,70 @@ gcal_rsvp_respond (GcalManager               *manager,
   g_task_set_source_tag (task, gcal_rsvp_respond);
   g_task_set_task_data (task, data, (GDestroyNotify) respond_data_free);
   g_task_run_in_thread (task, respond_thread);
+}
+
+/**
+ * gcal_rsvp_dup_event_with_user_status:
+ * @manager: a #GcalManager
+ * @event: a #GcalEvent
+ * @status: the user's new participation status
+ *
+ * Builds a copy of @event where the user's ATTENDEE carries @status, so the UI
+ * can show a reply before the backend sends the updated event back.
+ *
+ * Returns: (transfer full) (nullable): a new #GcalEvent
+ */
+GcalEvent *
+gcal_rsvp_dup_event_with_user_status (GcalManager               *manager,
+                                      GcalEvent                 *event,
+                                      GcalEventAttendeePartStat  status)
+{
+  g_autoptr (GHashTable) addresses = NULL;
+  g_autoptr (ICalProperty) attendee = NULL;
+  g_autoptr (ECalComponent) component = NULL;
+  g_autoptr (GError) error = NULL;
+  ICalParameterPartstat partstat;
+  ICalComponent *icomp;
+  GcalEvent *copy;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), NULL);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), NULL);
+
+  switch (status)
+    {
+    case GCAL_EVENT_ATTENDEE_PART_ACCEPTED:
+      partstat = I_CAL_PARTSTAT_ACCEPTED;
+      break;
+
+    case GCAL_EVENT_ATTENDEE_PART_TENTATIVE:
+      partstat = I_CAL_PARTSTAT_TENTATIVE;
+      break;
+
+    case GCAL_EVENT_ATTENDEE_PART_DECLINED:
+      partstat = I_CAL_PARTSTAT_DECLINED;
+      break;
+
+    default:
+      partstat = I_CAL_PARTSTAT_NEEDSACTION;
+      break;
+    }
+
+  component = e_cal_component_clone (gcal_event_get_component (event));
+  icomp = e_cal_component_get_icalcomponent (component);
+  addresses = gcal_rsvp_dup_user_addresses (manager, gcal_event_get_calendar (event));
+
+  attendee = find_user_attendee (icomp, addresses);
+  if (!attendee)
+    return NULL;
+
+  i_cal_property_remove_parameter_by_kind (attendee, I_CAL_PARTSTAT_PARAMETER);
+  i_cal_property_take_parameter (attendee, i_cal_parameter_new_partstat (partstat));
+
+  copy = gcal_event_new (gcal_event_get_calendar (event), component, &error);
+  if (error)
+    g_warning ("Could not copy event: %s", error->message);
+
+  return copy;
 }
 
 gboolean
