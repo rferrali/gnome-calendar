@@ -34,6 +34,7 @@
 #include <glib/gi18n.h>
 
 #include "gcal-application.h"
+#include "gcal-contact-search.h"
 #include "gcal-context.h"
 #include "gcal-event-attendee.h"
 #include "gcal-event-organizer.h"
@@ -46,8 +47,17 @@ struct _GcalGuestList
 
   GtkListBox         *list;
   gboolean            editable;
+  gboolean            keep_last_guest;
+  guint               n_removable;
   GtkWidget          *add_row;
   guint               n_guests;
+
+  /* Suggestions for the "Add Guest" row */
+  GtkWidget          *popover;
+  GtkListBox         *suggestions;
+  GHashTable         *excluded;      /* lower addresses: current guests and the user */
+  guint               search_timeout_id;
+  GCancellable       *search_cancellable;
   gchar              *summary;
 };
 
@@ -196,23 +206,54 @@ on_remove_button_clicked_cb (GtkButton     *button,
   g_signal_emit (self, signals[REMOVE_GUEST], 0, address);
 }
 
+#define MAX_SUGGESTIONS 8
+#define SEARCH_DELAY_MS 150
+
+static void
+hide_suggestions (GcalGuestList *self)
+{
+  g_clear_handle_id (&self->search_timeout_id, g_source_remove);
+  g_cancellable_cancel (self->search_cancellable);
+  g_clear_object (&self->search_cancellable);
+
+  if (self->popover)
+    gtk_popover_popdown (GTK_POPOVER (self->popover));
+}
+
+static void
+emit_add_guest (GcalGuestList *self,
+                const gchar   *address,
+                const gchar   *name)
+{
+  hide_suggestions (self);
+  g_signal_emit (self, signals[ADD_GUEST], 0, address, name);
+}
+
 static void
 on_add_guest_cb (AdwEntryRow   *entry_row,
                  GcalGuestList *self)
 {
+  g_autofree gchar *text = NULL;
   g_autofree gchar *address = NULL;
+  g_autofree gchar *name = NULL;
 
-  address = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (entry_row))));
-  if (!address || !*address)
+  text = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (entry_row))));
+  if (!text || !*text)
     return;
 
   /* Accept "Name <address>" as well as a bare address */
-  if (strchr (address, '<') && strchr (address, '>'))
+  if (strchr (text, '<') && strchr (text, '>') > strchr (text, '<'))
     {
-      g_autofree gchar *inner = g_strndup (strchr (address, '<') + 1,
-                                           strchr (address, '>') - strchr (address, '<') - 1);
-      g_free (address);
-      address = g_strstrip (g_steal_pointer (&inner));
+      address = g_strndup (strchr (text, '<') + 1, strchr (text, '>') - strchr (text, '<') - 1);
+      name = g_strndup (text, strchr (text, '<') - text);
+      g_strstrip (address);
+      g_strstrip (name);
+      g_strdelimit (name, "\"", ' ');
+      g_strstrip (name);
+    }
+  else
+    {
+      address = g_strdup (text);
     }
 
   if (!strchr (address, '@') || strchr (address, ' '))
@@ -222,22 +263,277 @@ on_add_guest_cb (AdwEntryRow   *entry_row,
     }
 
   gtk_widget_remove_css_class (GTK_WIDGET (entry_row), "error");
-  g_signal_emit (self, signals[ADD_GUEST], 0, address);
+  emit_add_guest (self, address, (name && *name) ? name : NULL);
+}
+
+static void
+pick_suggestion (GcalGuestList *self,
+                 GtkListBoxRow *row)
+{
+  const gchar *address = g_object_get_data (G_OBJECT (row), "address");
+  const gchar *name = g_object_get_data (G_OBJECT (row), "name");
+
+  if (address)
+    emit_add_guest (self, address, name);
+}
+
+static void
+on_suggestion_activated_cb (GtkListBox    *list,
+                            GtkListBoxRow *row,
+                            GcalGuestList *self)
+{
+  pick_suggestion (self, row);
+}
+
+static GtkWidget *
+create_suggestion_row (GcalContactMatch *match)
+{
+  const gchar *icon_name;
+  const gchar *tooltip;
+  GtkWidget *image;
+  GtkWidget *row;
+
+  row = adw_action_row_new ();
+  adw_preferences_row_set_use_markup (ADW_PREFERENCES_ROW (row), FALSE);
+  gtk_list_box_row_set_activatable (GTK_LIST_BOX_ROW (row), TRUE);
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), match->name ? match->name : match->address);
+  if (match->name)
+    adw_action_row_set_subtitle (ADW_ACTION_ROW (row), match->address);
+
+  switch (match->origin)
+    {
+    case GCAL_CONTACT_ORIGIN_ADDRESS_BOOK:
+      icon_name = "x-office-address-book-symbolic";
+      tooltip = _("From your contacts");
+      break;
+
+    case GCAL_CONTACT_ORIGIN_DIRECTORY:
+      icon_name = "system-users-symbolic";
+      tooltip = _("From the directory");
+      break;
+
+    case GCAL_CONTACT_ORIGIN_MAIL_HISTORY:
+    default:
+      icon_name = "mail-unread-symbolic";
+      tooltip = _("From your mail");
+      break;
+    }
+
+  image = gtk_image_new_from_icon_name (icon_name);
+  gtk_widget_add_css_class (image, "dimmed");
+  gtk_widget_set_tooltip_text (image, tooltip);
+  adw_action_row_add_prefix (ADW_ACTION_ROW (row), image);
+
+  g_object_set_data_full (G_OBJECT (row), "address", g_strdup (match->address), g_free);
+  g_object_set_data_full (G_OBJECT (row), "name", g_strdup (match->name), g_free);
+
+  return row;
+}
+
+static void
+show_suggestions (GcalGuestList *self)
+{
+  graphene_rect_t bounds;
+  GdkRectangle rect;
+
+  if (!self->add_row || !gtk_widget_get_mapped (self->add_row))
+    return;
+
+  if (!gtk_widget_compute_bounds (self->add_row, GTK_WIDGET (self), &bounds))
+    return;
+
+  rect.x = (gint) bounds.origin.x;
+  rect.y = (gint) bounds.origin.y;
+  rect.width = (gint) bounds.size.width;
+  rect.height = (gint) bounds.size.height;
+
+  gtk_popover_set_pointing_to (GTK_POPOVER (self->popover), &rect);
+  gtk_widget_set_size_request (gtk_popover_get_child (GTK_POPOVER (self->popover)), rect.width, -1);
+  gtk_popover_popup (GTK_POPOVER (self->popover));
+}
+
+static void
+on_search_finished_cb (GObject      *source_object,
+                       GAsyncResult *result,
+                       gpointer      user_data)
+{
+  g_autoptr (GcalGuestList) self = user_data;
+  g_autoptr (GPtrArray) matches = NULL;
+  g_autoptr (GError) error = NULL;
+  const gchar *text;
+  guint shown = 0;
+
+  matches = gcal_contact_search_finish (result, &error);
+  if (!matches)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        g_warning ("Guest suggestions failed: %s", error ? error->message : "unknown error");
+      return;
+    }
+
+  if (!self->add_row)
+    return;
+
+  gtk_list_box_remove_all (self->suggestions);
+
+  for (guint i = 0; i < matches->len && shown < MAX_SUGGESTIONS; i++)
+    {
+      GcalContactMatch *match = g_ptr_array_index (matches, i);
+      g_autofree gchar *key = g_ascii_strdown (match->address, -1);
+
+      if (self->excluded && g_hash_table_contains (self->excluded, key))
+        continue;
+
+      gtk_list_box_append (self->suggestions, create_suggestion_row (match));
+      shown++;
+    }
+
+  if (shown == 0)
+    {
+      gtk_popover_popdown (GTK_POPOVER (self->popover));
+      return;
+    }
+
+  /* Preselect the best match, unless a full address is being typed */
+  text = gtk_editable_get_text (GTK_EDITABLE (self->add_row));
+  if (!strchr (text, '@'))
+    gtk_list_box_select_row (self->suggestions, gtk_list_box_get_row_at_index (self->suggestions, 0));
+
+  show_suggestions (self);
+}
+
+static gboolean
+start_search_cb (gpointer user_data)
+{
+  GcalGuestList *self = user_data;
+  GcalManager *manager;
+  const gchar *text;
+
+  self->search_timeout_id = 0;
+
+  if (!self->add_row)
+    return G_SOURCE_REMOVE;
+
+  text = gtk_editable_get_text (GTK_EDITABLE (self->add_row));
+  manager = gcal_context_get_manager (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+
+  g_cancellable_cancel (self->search_cancellable);
+  g_clear_object (&self->search_cancellable);
+  self->search_cancellable = g_cancellable_new ();
+
+  gcal_contact_search (manager,
+                       text,
+                       MAX_SUGGESTIONS * 2,
+                       self->search_cancellable,
+                       on_search_finished_cb,
+                       g_object_ref (self));
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+on_add_row_text_changed_cb (GtkEditable   *editable,
+                            GcalGuestList *self)
+{
+  const gchar *text = gtk_editable_get_text (editable);
+
+  gtk_widget_remove_css_class (GTK_WIDGET (editable), "error");
+  g_clear_handle_id (&self->search_timeout_id, g_source_remove);
+
+  if (g_utf8_strlen (text, -1) < 2)
+    {
+      hide_suggestions (self);
+      return;
+    }
+
+  self->search_timeout_id = g_timeout_add (SEARCH_DELAY_MS, start_search_cb, self);
+}
+
+static void
+move_selection (GcalGuestList *self,
+                gint           delta)
+{
+  GtkListBoxRow *selected = gtk_list_box_get_selected_row (self->suggestions);
+  GtkListBoxRow *row;
+  gint index;
+
+  index = selected ? gtk_list_box_row_get_index (selected) + delta : (delta > 0 ? 0 : -1);
+  if (index < 0)
+    {
+      gtk_list_box_unselect_all (self->suggestions);
+      return;
+    }
+
+  row = gtk_list_box_get_row_at_index (self->suggestions, index);
+  if (row)
+    gtk_list_box_select_row (self->suggestions, row);
+}
+
+static gboolean
+on_add_row_key_pressed_cb (GtkEventControllerKey *controller,
+                           guint                  keyval,
+                           guint                  keycode,
+                           GdkModifierType        state,
+                           GcalGuestList         *self)
+{
+  GtkListBoxRow *selected;
+
+  if (!gtk_widget_get_visible (self->popover))
+    return GDK_EVENT_PROPAGATE;
+
+  switch (keyval)
+    {
+    case GDK_KEY_Down:
+    case GDK_KEY_KP_Down:
+      move_selection (self, 1);
+      return GDK_EVENT_STOP;
+
+    case GDK_KEY_Up:
+    case GDK_KEY_KP_Up:
+      move_selection (self, -1);
+      return GDK_EVENT_STOP;
+
+    case GDK_KEY_Escape:
+      hide_suggestions (self);
+      return GDK_EVENT_STOP;
+
+    case GDK_KEY_Return:
+    case GDK_KEY_KP_Enter:
+    case GDK_KEY_ISO_Enter:
+    case GDK_KEY_Tab:
+      selected = gtk_list_box_get_selected_row (self->suggestions);
+      if (selected)
+        {
+          pick_suggestion (self, selected);
+          return GDK_EVENT_STOP;
+        }
+      return GDK_EVENT_PROPAGATE;
+
+    default:
+      return GDK_EVENT_PROPAGATE;
+    }
 }
 
 static GtkWidget *
 create_add_row (GcalGuestList *self)
 {
+  GtkEventController *controller;
   GtkWidget *row;
 
   row = adw_entry_row_new ();
   adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), _("Add Guest"));
   adw_entry_row_set_show_apply_button (ADW_ENTRY_ROW (row), TRUE);
   adw_entry_row_set_input_purpose (ADW_ENTRY_ROW (row), GTK_INPUT_PURPOSE_EMAIL);
-  gtk_widget_set_tooltip_text (row, _("Type an email address and press Enter"));
+  gtk_widget_set_tooltip_text (row, _("Type a name or an email address"));
 
   g_signal_connect (row, "apply", G_CALLBACK (on_add_guest_cb), self);
   g_signal_connect (row, "entry-activated", G_CALLBACK (on_add_guest_cb), self);
+  g_signal_connect (row, "changed", G_CALLBACK (on_add_row_text_changed_cb), self);
+
+  controller = gtk_event_controller_key_new ();
+  gtk_event_controller_set_propagation_phase (controller, GTK_PHASE_CAPTURE);
+  g_signal_connect (controller, "key-pressed", G_CALLBACK (on_add_row_key_pressed_cb), self);
+  gtk_widget_add_controller (row, controller);
 
   return row;
 }
@@ -300,7 +596,10 @@ create_row (GcalGuestList *self,
       adw_action_row_add_suffix (ADW_ACTION_ROW (row), label);
     }
 
-  if (self->editable && !guest->is_organizer && guest->address)
+  /* evolution-ews never sends an empty guest list to Exchange, so the last
+   * guest of a saved meeting cannot be removed (delete the event instead) */
+  if (self->editable && !guest->is_organizer && guest->address &&
+      !(self->keep_last_guest && self->n_removable <= 1))
     {
       GtkWidget *button;
 
@@ -396,9 +695,40 @@ build_summary (GPtrArray *guests)
  */
 
 static void
+gcal_guest_list_size_allocate (GtkWidget *widget,
+                               int        width,
+                               int        height,
+                               int        baseline)
+{
+  GcalGuestList *self = GCAL_GUEST_LIST (widget);
+
+  GTK_WIDGET_CLASS (gcal_guest_list_parent_class)->size_allocate (widget, width, height, baseline);
+
+  if (self->popover)
+    gtk_popover_present (GTK_POPOVER (self->popover));
+}
+
+static void
+gcal_guest_list_dispose (GObject *object)
+{
+  GcalGuestList *self = (GcalGuestList *) object;
+
+  g_clear_handle_id (&self->search_timeout_id, g_source_remove);
+  g_cancellable_cancel (self->search_cancellable);
+  g_clear_object (&self->search_cancellable);
+  g_clear_pointer (&self->popover, gtk_widget_unparent);
+  self->suggestions = NULL;
+  self->add_row = NULL;
+
+  G_OBJECT_CLASS (gcal_guest_list_parent_class)->dispose (object);
+}
+
+static void
 gcal_guest_list_finalize (GObject *object)
 {
   GcalGuestList *self = (GcalGuestList *) object;
+
+  g_clear_pointer (&self->excluded, g_hash_table_unref);
 
   g_clear_pointer (&self->summary, g_free);
 
@@ -433,7 +763,10 @@ gcal_guest_list_class_init (GcalGuestListClass *klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS (klass);
 
+  object_class->dispose = gcal_guest_list_dispose;
   object_class->finalize = gcal_guest_list_finalize;
+
+  GTK_WIDGET_CLASS (klass)->size_allocate = gcal_guest_list_size_allocate;
   object_class->get_property = gcal_guest_list_get_property;
 
   properties[PROP_N_GUESTS] = g_param_spec_uint ("n-guests", NULL, NULL,
@@ -454,7 +787,8 @@ gcal_guest_list_class_init (GcalGuestListClass *klass)
    */
   /**
    * GcalGuestList::add-guest:
-   * @address: the email address typed in the "Add Guest" row
+   * @address: the email address typed or picked in the "Add Guest" row
+   * @name: (nullable): the guest's name, if known
    *
    * Emitted when a guest is added (editable lists only).
    */
@@ -463,7 +797,8 @@ gcal_guest_list_class_init (GcalGuestListClass *klass)
                                      G_SIGNAL_RUN_LAST,
                                      0, NULL, NULL, NULL,
                                      G_TYPE_NONE,
-                                     1,
+                                     2,
+                                     G_TYPE_STRING,
                                      G_TYPE_STRING);
 
   signals[REMOVE_GUEST] = g_signal_new ("remove-guest",
@@ -484,6 +819,32 @@ gcal_guest_list_init (GcalGuestList *self)
   gtk_list_box_set_selection_mode (self->list, GTK_SELECTION_NONE);
   gtk_widget_add_css_class (GTK_WIDGET (self->list), "boxed-list");
   gtk_box_append (GTK_BOX (self), GTK_WIDGET (self->list));
+
+  /* Suggestions popover; does not take the focus away from the entry */
+  {
+    GtkWidget *scrolled;
+
+    self->suggestions = GTK_LIST_BOX (gtk_list_box_new ());
+    gtk_list_box_set_selection_mode (self->suggestions, GTK_SELECTION_SINGLE);
+    gtk_list_box_set_activate_on_single_click (self->suggestions, TRUE);
+    gtk_widget_add_css_class (GTK_WIDGET (self->suggestions), "navigation-sidebar");
+    g_signal_connect (self->suggestions, "row-activated", G_CALLBACK (on_suggestion_activated_cb), self);
+
+    scrolled = gtk_scrolled_window_new ();
+    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scrolled), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_scrolled_window_set_propagate_natural_height (GTK_SCROLLED_WINDOW (scrolled), TRUE);
+    gtk_scrolled_window_set_max_content_height (GTK_SCROLLED_WINDOW (scrolled), 320);
+    gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (scrolled), GTK_WIDGET (self->suggestions));
+
+    self->popover = gtk_popover_new ();
+    gtk_popover_set_child (GTK_POPOVER (self->popover), scrolled);
+    gtk_popover_set_autohide (GTK_POPOVER (self->popover), FALSE);
+    gtk_popover_set_has_arrow (GTK_POPOVER (self->popover), FALSE);
+    gtk_popover_set_position (GTK_POPOVER (self->popover), GTK_POS_BOTTOM);
+    gtk_widget_set_can_focus (self->popover, FALSE);
+    gtk_widget_set_halign (self->popover, GTK_ALIGN_START);
+    gtk_widget_set_parent (self->popover, GTK_WIDGET (self));
+  }
 }
 
 GtkWidget*
@@ -514,8 +875,10 @@ gcal_guest_list_set_event (GcalGuestList *self,
 
   g_return_if_fail (GCAL_IS_GUEST_LIST (self));
 
+  hide_suggestions (self);
   gtk_list_box_remove_all (self->list);
   self->add_row = NULL;
+  g_clear_pointer (&self->excluded, g_hash_table_unref);
 
   if (!event)
     {
@@ -585,6 +948,34 @@ gcal_guest_list_set_event (GcalGuestList *self,
 
   g_ptr_array_sort (guests, compare_guests);
 
+  self->n_removable = 0;
+  for (guint i = 0; i < guests->len; i++)
+    {
+      Guest *guest = g_ptr_array_index (guests, i);
+
+      if (!guest->is_organizer && guest->address)
+        self->n_removable++;
+    }
+
+  /* Never suggest current guests or the user */
+  self->excluded = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  for (guint i = 0; i < guests->len; i++)
+    {
+      Guest *guest = g_ptr_array_index (guests, i);
+
+      if (guest->address)
+        g_hash_table_add (self->excluded, g_ascii_strdown (guest->address, -1));
+    }
+  if (user_addresses)
+    {
+      GHashTableIter iter;
+      gpointer key;
+
+      g_hash_table_iter_init (&iter, user_addresses);
+      while (g_hash_table_iter_next (&iter, &key, NULL))
+        g_hash_table_add (self->excluded, g_strdup (key));
+    }
+
   for (guint i = 0; i < guests->len; i++)
     gtk_list_box_append (self->list, create_row (self, g_ptr_array_index (guests, i)));
 
@@ -643,4 +1034,21 @@ gcal_guest_list_focus_add_row (GcalGuestList *self)
 
   if (self->add_row)
     gtk_widget_grab_focus (self->add_row);
+}
+
+/**
+ * gcal_guest_list_set_keep_last_guest:
+ * @self: a #GcalGuestList
+ * @keep_last_guest: whether the last guest must stay
+ *
+ * When set, the remove button is not offered on the only remaining guest.
+ * Takes effect on the next gcal_guest_list_set_event().
+ */
+void
+gcal_guest_list_set_keep_last_guest (GcalGuestList *self,
+                                     gboolean       keep_last_guest)
+{
+  g_return_if_fail (GCAL_IS_GUEST_LIST (self));
+
+  self->keep_last_guest = keep_last_guest;
 }

@@ -41,4 +41,7 @@ void                 gcal_guest_list_set_editable                (GcalGuestList 
 
 void                 gcal_guest_list_focus_add_row               (GcalGuestList      *self);
 
+void                 gcal_guest_list_set_keep_last_guest         (GcalGuestList      *self,
+                                                                  gboolean            keep_last_guest);
+
 G_END_DECLS

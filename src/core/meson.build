@@ -4,6 +4,7 @@ sources += files(
   'gcal-calendar.c',
   'gcal-calendar-monitor.c',
   'gcal-clock.c',
+  'gcal-contact-search.c',
   'gcal-context.c',
   'gcal-event.c',
   'gcal-event-list.c',
