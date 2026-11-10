@@ -753,3 +753,96 @@ gcal_rsvp_guests_equal (GcalEvent *event1,
 
   return TRUE;
 }
+
+/**
+ * gcal_rsvp_count_guest_changes:
+ * @original: the event as it was
+ * @edited: the edited event
+ * @out_added: (out): guests only in @edited
+ * @out_removed: (out): guests only in @original
+ * @out_kept: (out): guests in both
+ *
+ * Counts how the guests changed, to tell the user who will get an email.
+ */
+void
+gcal_rsvp_count_guest_changes (GcalEvent *original,
+                               GcalEvent *edited,
+                               guint     *out_added,
+                               guint     *out_removed,
+                               guint     *out_kept)
+{
+  g_autoptr (GHashTable) before = NULL;
+  g_autoptr (GHashTable) after = NULL;
+  guint added = 0, removed = 0, kept = 0;
+  GHashTableIter iter;
+  gpointer key;
+
+  g_return_if_fail (GCAL_IS_EVENT (edited));
+
+  before = original ? dup_guest_set (original) : g_hash_table_new (g_str_hash, g_str_equal);
+  after = dup_guest_set (edited);
+
+  g_hash_table_iter_init (&iter, after);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      if (g_hash_table_contains (before, key))
+        kept++;
+      else
+        added++;
+    }
+
+  g_hash_table_iter_init (&iter, before);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      if (!g_hash_table_contains (after, key))
+        removed++;
+    }
+
+  if (out_added)
+    *out_added = added;
+  if (out_removed)
+    *out_removed = removed;
+  if (out_kept)
+    *out_kept = kept;
+}
+
+/**
+ * gcal_rsvp_copy_guests:
+ * @from: a #GcalEvent
+ * @to: a #GcalEvent
+ *
+ * Replaces the ORGANIZER and ATTENDEE properties of @to with those of @from,
+ * e.g. when applying an edited occurrence to the whole series.
+ */
+void
+gcal_rsvp_copy_guests (GcalEvent *from,
+                       GcalEvent *to)
+{
+  ICalComponent *source;
+  ICalComponent *target;
+  ICalProperty *prop;
+
+  g_return_if_fail (GCAL_IS_EVENT (from) && GCAL_IS_EVENT (to));
+
+  source = e_cal_component_get_icalcomponent (gcal_event_get_component (from));
+  target = e_cal_component_get_icalcomponent (gcal_event_get_component (to));
+
+  e_cal_util_component_remove_property_by_kind (target, I_CAL_ORGANIZER_PROPERTY, TRUE);
+  e_cal_util_component_remove_property_by_kind (target, I_CAL_ATTENDEE_PROPERTY, TRUE);
+
+  prop = i_cal_component_get_first_property (source, I_CAL_ORGANIZER_PROPERTY);
+  if (prop)
+    {
+      i_cal_component_take_property (target, i_cal_property_clone (prop));
+      g_object_unref (prop);
+    }
+
+  for (prop = i_cal_component_get_first_property (source, I_CAL_ATTENDEE_PROPERTY);
+       prop;
+       g_object_unref (prop), prop = i_cal_component_get_next_property (source, I_CAL_ATTENDEE_PROPERTY))
+    {
+      i_cal_component_take_property (target, i_cal_property_clone (prop));
+    }
+
+  gcal_event_reload_attendees (to);
+}
