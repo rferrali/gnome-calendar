@@ -357,6 +357,15 @@ on_show_attendees_detail_page_action_activated_cb (GtkWidget  *widget,
                             ADW_NAVIGATION_PAGE (self->attendee_details_page));
 }
 
+/* Fork: lets sections close the dialog, e.g. after declining an invitation */
+static void
+on_event_editor_close_action_activated_cb (GtkWidget  *widget,
+                                           const char *action_name,
+                                           GVariant   *param)
+{
+  clear_and_hide_dialog (GCAL_EVENT_EDITOR_DIALOG (widget));
+}
+
 static void
 on_cancel_button_clicked_cb (GtkButton             *button,
                              GcalEventEditorDialog *self)
@@ -636,6 +645,7 @@ gcal_event_editor_dialog_class_init (GcalEventEditorDialogClass *klass)
   gtk_widget_class_bind_template_callback (widget_class, on_delete_row_activated_cb);
 
   gtk_widget_class_install_action (widget_class, "event-editor.save", NULL, on_event_editor_save_action_activated_cb);
+  gtk_widget_class_install_action (widget_class, "event-editor.close", NULL, on_event_editor_close_action_activated_cb);
   gtk_widget_class_install_action (widget_class, "event-editor.show-attendees-detail-page", "u",
                                    on_show_attendees_detail_page_action_activated_cb);
 }
