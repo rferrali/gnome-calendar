@@ -12,32 +12,8 @@ template $GcalAttendeesSection: $GcalEventEditorSection {
     visible: false;
 
     [suffix]
-    Box response_buttons {
-      valign: center;
-
-      styles [
-        "linked",
-      ]
-
-      ToggleButton accept_button {
-        label: _("_Accept");
-        use-underline: true;
-        toggled => $on_response_button_toggled_cb();
-      }
-
-      ToggleButton tentative_button {
-        label: _("_Maybe");
-        use-underline: true;
-        group: accept_button;
-        toggled => $on_response_button_toggled_cb();
-      }
-
-      ToggleButton decline_button {
-        label: _("_Decline");
-        use-underline: true;
-        group: accept_button;
-        toggled => $on_response_button_toggled_cb();
-      }
+    $GcalRsvpBox rsvp_box {
+      responded => $on_rsvp_responded_cb(template) not-swapped;
     }
   }
 

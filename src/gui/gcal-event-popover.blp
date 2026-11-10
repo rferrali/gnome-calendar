@@ -97,6 +97,31 @@ template $GcalEventPopover: Popover {
         }
       }
 
+      /* Fork: reply to the invitation */
+      Box rsvp_container {
+        orientation: vertical;
+        spacing: 6;
+        visible: false;
+        margin-start: 18;
+        margin-end: 18;
+        margin-bottom: 12;
+
+        $GcalRsvpBox rsvp_box {
+          responded => $on_rsvp_responded_cb(template) not-swapped;
+        }
+
+        Label rsvp_status_label {
+          xalign: 0.0;
+          wrap: true;
+          wrap-mode: word_char;
+
+          styles [
+            "dimmed",
+            "caption",
+          ]
+        }
+      }
+
       Separator {}
 
       Label placeholder_label {
@@ -195,6 +220,55 @@ template $GcalEventPopover: Popover {
           styles [
             "calendar-list",
           ]
+        }
+      }
+
+      /* Fork: guests and their replies */
+      Box guests_box {
+        orientation: vertical;
+        visible: false;
+
+        Separator {}
+
+        Box {
+          orientation: vertical;
+          spacing: 6;
+          margin-top: 12;
+          margin-bottom: 18;
+          margin-start: 18;
+          margin-end: 18;
+
+          Box {
+            spacing: 6;
+
+            Label {
+              halign: start;
+              label: _("Guests");
+
+              styles [
+                "heading",
+              ]
+            }
+
+            Label guests_summary_label {
+              halign: end;
+              hexpand: true;
+              ellipsize: end;
+
+              styles [
+                "dimmed",
+                "caption",
+              ]
+            }
+          }
+
+          ScrolledWindow {
+            hscrollbar-policy: never;
+            propagate-natural-height: true;
+            max-content-height: 240;
+
+            child: $GcalGuestList guest_list {};
+          }
         }
       }
     };
