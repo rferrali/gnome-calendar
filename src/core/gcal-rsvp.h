@@ -66,4 +66,13 @@ void                 gcal_rsvp_remove_guest                      (GcalManager   
 gboolean             gcal_rsvp_guests_equal                      (GcalEvent                 *event1,
                                                                   GcalEvent                 *event2);
 
+void                 gcal_rsvp_count_guest_changes               (GcalEvent                 *original,
+                                                                  GcalEvent                 *edited,
+                                                                  guint                     *out_added,
+                                                                  guint                     *out_removed,
+                                                                  guint                     *out_kept);
+
+void                 gcal_rsvp_copy_guests                       (GcalEvent                 *from,
+                                                                  GcalEvent                 *to);
+
 G_END_DECLS
