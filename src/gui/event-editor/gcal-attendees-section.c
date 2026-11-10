@@ -49,6 +49,7 @@ struct _GcalAttendeesSection
   AdwActionRow        *response_row;
   GcalRsvpBox         *rsvp_box;
   GcalGuestList       *guest_list;
+  gboolean             had_guests;
 };
 
 G_DEFINE_FINAL_TYPE (GcalAttendeesSection, gcal_attendees_section, GCAL_TYPE_EVENT_EDITOR_SECTION)
@@ -86,6 +87,7 @@ refresh_guests (GcalAttendeesSection *self)
     editable = gcal_rsvp_can_edit_guests (get_manager (), event);
 
   gcal_guest_list_set_editable (self->guest_list, editable);
+  gcal_guest_list_set_keep_last_guest (self->guest_list, self->had_guests);
   gcal_guest_list_set_event (self->guest_list, event);
 
   gtk_widget_set_visible (GTK_WIDGET (self),
@@ -97,6 +99,7 @@ refresh_guests (GcalAttendeesSection *self)
 static void
 on_add_guest_cb (GcalGuestList        *guest_list,
                  const gchar          *address,
+                 const gchar          *name,
                  GcalAttendeesSection *self)
 {
   GcalEvent *event = gcal_event_editor_section_get_event (GCAL_EVENT_EDITOR_SECTION (self));
@@ -104,7 +107,7 @@ on_add_guest_cb (GcalGuestList        *guest_list,
   if (!event)
     return;
 
-  gcal_rsvp_add_guest (get_manager (), event, address, NULL);
+  gcal_rsvp_add_guest (get_manager (), event, address, name);
   refresh_guests (self);
   gcal_guest_list_focus_add_row (self->guest_list);
 }
@@ -154,6 +157,10 @@ gcal_attendees_section_event_set_cb (GcalEventEditorSection *section,
       self->organizer = NULL;
       self->attendees = NULL;
     }
+
+  /* A meeting that already had guests is on the server: its last guest
+   * cannot be removed through evolution-ews */
+  self->had_guests = event && e_cal_component_has_attendees (gcal_event_get_component (event));
 
   gcal_rsvp_box_set_event (self->rsvp_box, event);
   refresh_guests (self);
