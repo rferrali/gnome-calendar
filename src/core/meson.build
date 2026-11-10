@@ -13,6 +13,7 @@ sources += files(
   'gcal-range.c',
   'gcal-range-tree.c',
   'gcal-recurrence.c',
+  'gcal-rsvp.c',
   'gcal-shell-search-provider.c',
   'gcal-timeline.c',
   'gcal-timeline-subscriber.c',

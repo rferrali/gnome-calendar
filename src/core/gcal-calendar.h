@@ -78,6 +78,8 @@ gboolean             gcal_calendar_is_read_only                  (GcalCalendar  
 
 ESource*             gcal_calendar_get_source                    (GcalCalendar       *self);
 
+const gchar*         gcal_calendar_get_user_email                (GcalCalendar       *self);
+
 gboolean             gcal_calendar_get_visible                   (GcalCalendar       *self);
 
 void                 gcal_calendar_set_visible                   (GcalCalendar       *self,

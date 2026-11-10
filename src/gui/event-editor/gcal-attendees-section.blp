@@ -1,8 +1,44 @@
 using Gtk 4.0;
+using Adw 1;
 
 template $GcalAttendeesSection: $GcalEventEditorSection {
   $GcalOrganizerRow organizer_row {
     organizer: bind template.organizer;
+  }
+
+  /* Fork: reply to the invitation */
+  Adw.ActionRow response_row {
+    title: _("Your Response");
+    visible: false;
+
+    [suffix]
+    Box response_buttons {
+      valign: center;
+
+      styles [
+        "linked",
+      ]
+
+      ToggleButton accept_button {
+        label: _("_Accept");
+        use-underline: true;
+        toggled => $on_response_button_toggled_cb();
+      }
+
+      ToggleButton tentative_button {
+        label: _("_Maybe");
+        use-underline: true;
+        group: accept_button;
+        toggled => $on_response_button_toggled_cb();
+      }
+
+      ToggleButton decline_button {
+        label: _("_Decline");
+        use-underline: true;
+        group: accept_button;
+        toggled => $on_response_button_toggled_cb();
+      }
+    }
   }
 
   $GcalAttendeeSummaryRow summary_row {

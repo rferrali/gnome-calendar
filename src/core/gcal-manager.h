@@ -37,6 +37,8 @@ ESource*             gcal_manager_get_source                     (GcalManager   
 
 GList*               gcal_manager_get_calendars                  (GcalManager        *self);
 
+ESourceRegistry*     gcal_manager_get_source_registry            (GcalManager        *self);
+
 GListModel*          gcal_manager_get_calendars_model            (GcalManager        *self);
 
 GcalCalendar*        gcal_manager_get_default_calendar           (GcalManager        *self);

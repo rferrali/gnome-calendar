@@ -1325,3 +1325,19 @@ gcal_manager_startup (GcalManager *self)
 
   GCAL_EXIT;
 }
+
+/**
+ * gcal_manager_get_source_registry:
+ * @self: a #GcalManager
+ *
+ * Fork addition.
+ *
+ * Returns: (transfer none) (nullable): the #ESourceRegistry
+ */
+ESourceRegistry*
+gcal_manager_get_source_registry (GcalManager *self)
+{
+  g_return_val_if_fail (GCAL_IS_MANAGER (self), NULL);
+
+  return self->source_registry;
+}
