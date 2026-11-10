@@ -2,9 +2,7 @@ using Gtk 4.0;
 using Adw 1;
 
 template $GcalAttendeesSection: $GcalEventEditorSection {
-  $GcalOrganizerRow organizer_row {
-    organizer: bind template.organizer;
-  }
+  title: _("Guests");
 
   /* Fork: reply to the invitation */
   Adw.ActionRow response_row {
@@ -17,15 +15,9 @@ template $GcalAttendeesSection: $GcalEventEditorSection {
     }
   }
 
-  $GcalAttendeeSummaryRow summary_row {
-    title: _("Participants");
-    attendees: bind template.attendees;
-    filter-flags: GCAL_EVENT_ATTENDEE_TYPE_FILTER_PERSON;
-  }
-
-  $GcalAttendeeSummaryRow {
-    title: _("Resources");
-    attendees: bind template.attendees;
-    filter-flags: GCAL_EVENT_ATTENDEE_TYPE_FILTER_RESOURCE;
+  /* Fork: guests and their replies; editable when the user organizes the event */
+  $GcalGuestList guest_list {
+    add-guest => $on_add_guest_cb(template) not-swapped;
+    remove-guest => $on_remove_guest_cb(template) not-swapped;
   }
 }

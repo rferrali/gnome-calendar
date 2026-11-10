@@ -30,6 +30,8 @@
 #include "gcal-organizer-row.h"
 #include "gcal-application.h"
 #include "gcal-context.h"
+#include "gcal-guest-list.h"
+#include "gcal-rsvp.h"
 #include "gcal-rsvp-box.h"
 #include "gcal-utils.h"
 #include "glib-object.h"
@@ -40,13 +42,13 @@ struct _GcalAttendeesSection
 
   GcalEventOrganizer  *organizer;
 
-  AdwActionRow        *summary_row;
 
   GListModel          *attendees;
 
   /* Fork: reply to the invitation */
   AdwActionRow        *response_row;
   GcalRsvpBox         *rsvp_box;
+  GcalGuestList       *guest_list;
 };
 
 G_DEFINE_FINAL_TYPE (GcalAttendeesSection, gcal_attendees_section, GCAL_TYPE_EVENT_EDITOR_SECTION)
@@ -65,6 +67,61 @@ static GParamSpec *properties[N_PROPS] = { NULL, };
 /*
  * Fork: reply to the invitation
  */
+
+static GcalManager *
+get_manager (void)
+{
+  return gcal_context_get_manager (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+}
+
+static void
+refresh_guests (GcalAttendeesSection *self)
+{
+  GcalEvent *event;
+  gboolean editable = FALSE;
+
+  event = gcal_event_editor_section_get_event (GCAL_EVENT_EDITOR_SECTION (self));
+
+  if (event)
+    editable = gcal_rsvp_can_edit_guests (get_manager (), event);
+
+  gcal_guest_list_set_editable (self->guest_list, editable);
+  gcal_guest_list_set_event (self->guest_list, event);
+
+  gtk_widget_set_visible (GTK_WIDGET (self),
+                          editable ||
+                          gcal_guest_list_get_n_guests (self->guest_list) > 0 ||
+                          gcal_rsvp_box_get_can_respond (self->rsvp_box));
+}
+
+static void
+on_add_guest_cb (GcalGuestList        *guest_list,
+                 const gchar          *address,
+                 GcalAttendeesSection *self)
+{
+  GcalEvent *event = gcal_event_editor_section_get_event (GCAL_EVENT_EDITOR_SECTION (self));
+
+  if (!event)
+    return;
+
+  gcal_rsvp_add_guest (get_manager (), event, address, NULL);
+  refresh_guests (self);
+  gcal_guest_list_focus_add_row (self->guest_list);
+}
+
+static void
+on_remove_guest_cb (GcalGuestList        *guest_list,
+                    const gchar          *address,
+                    GcalAttendeesSection *self)
+{
+  GcalEvent *event = gcal_event_editor_section_get_event (GCAL_EVENT_EDITOR_SECTION (self));
+
+  if (!event)
+    return;
+
+  gcal_rsvp_remove_guest (get_manager (), event, address);
+  refresh_guests (self);
+}
 
 static void
 on_rsvp_responded_cb (GcalRsvpBox          *rsvp_box,
@@ -99,6 +156,7 @@ gcal_attendees_section_event_set_cb (GcalEventEditorSection *section,
     }
 
   gcal_rsvp_box_set_event (self->rsvp_box, event);
+  refresh_guests (self);
 
   g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_ATTENDEES]);
   g_object_notify_by_pspec (G_OBJECT (self), properties[PROP_ORGANIZER]);
@@ -213,11 +271,29 @@ gcal_attendees_section_class_init (GcalAttendeesSectionClass *klass)
 
   gtk_widget_class_set_template_from_resource (widget_class, "/org/gnome/calendar/ui/event-editor/gcal-attendees-section.ui");
 
-  gtk_widget_class_bind_template_child (widget_class, GcalAttendeesSection, summary_row);
   g_type_ensure (GCAL_TYPE_RSVP_BOX);
+  g_type_ensure (GCAL_TYPE_GUEST_LIST);
 
   gtk_widget_class_bind_template_child (widget_class, GcalAttendeesSection, response_row);
   gtk_widget_class_bind_template_child (widget_class, GcalAttendeesSection, rsvp_box);
+  gtk_widget_class_bind_template_child (widget_class, GcalAttendeesSection, guest_list);
 
   gtk_widget_class_bind_template_callback (widget_class, on_rsvp_responded_cb);
+  gtk_widget_class_bind_template_callback (widget_class, on_add_guest_cb);
+  gtk_widget_class_bind_template_callback (widget_class, on_remove_guest_cb);
+}
+
+/**
+ * gcal_attendees_section_refresh:
+ * @self: a #GcalAttendeesSection
+ *
+ * Fork addition. Re-evaluates whether guests can be edited, e.g. after the
+ * calendar of a new event changed.
+ */
+void
+gcal_attendees_section_refresh (GcalAttendeesSection *self)
+{
+  g_return_if_fail (GCAL_IS_ATTENDEES_SECTION (self));
+
+  refresh_guests (self);
 }

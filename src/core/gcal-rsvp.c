@@ -505,3 +505,251 @@ gcal_rsvp_respond_finish (GAsyncResult  *result,
 
   return g_task_propagate_boolean (G_TASK (result), error);
 }
+
+
+/*
+ * Editing guests (fork phase 3)
+ *
+ * The event editor edits a copy of the event in place; these helpers change
+ * its ORGANIZER / ATTENDEE properties and reload the GcalEvent's attendee
+ * model. Saving then goes through the normal create/modify path: when the
+ * user is the organizer, evolution-ews saves with SendToAllAndSaveCopy, so
+ * Exchange sends the invitations and updates itself.
+ */
+
+static gchar *
+dup_user_name (GcalManager *manager,
+               const gchar *address)
+{
+  g_autolist (ESource) identities = NULL;
+  ESourceRegistry *registry;
+
+  registry = gcal_manager_get_source_registry (manager);
+  if (!registry || !address)
+    return NULL;
+
+  identities = e_source_registry_list_enabled (registry, E_SOURCE_EXTENSION_MAIL_IDENTITY);
+
+  for (GList *l = identities; l; l = l->next)
+    {
+      ESourceMailIdentity *identity = e_source_get_extension (l->data, E_SOURCE_EXTENSION_MAIL_IDENTITY);
+
+      if (g_ascii_strcasecmp (e_source_mail_identity_get_address (identity) ?: "", address) == 0)
+        return e_source_mail_identity_dup_name (identity);
+    }
+
+  return NULL;
+}
+
+static guint
+count_attendees (ICalComponent *icomp)
+{
+  return i_cal_component_count_properties (icomp, I_CAL_ATTENDEE_PROPERTY);
+}
+
+/**
+ * gcal_rsvp_can_edit_guests:
+ * @manager: a #GcalManager
+ * @event: a #GcalEvent
+ *
+ * Returns: %TRUE if the guests of @event can be changed: the calendar is
+ * writable, has an account address to send invitations from, and the event
+ * has no organizer yet, or the user organizes it.
+ */
+gboolean
+gcal_rsvp_can_edit_guests (GcalManager *manager,
+                           GcalEvent   *event)
+{
+  g_autoptr (GHashTable) addresses = NULL;
+  GcalCalendar *calendar;
+  ICalComponent *icomp;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), FALSE);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), FALSE);
+
+  calendar = gcal_event_get_calendar (event);
+  if (!calendar || gcal_calendar_is_read_only (calendar))
+    return FALSE;
+
+  /* Only calendars with an account address (e.g. Exchange) can send invitations */
+  if (!gcal_calendar_get_user_email (calendar) || !*gcal_calendar_get_user_email (calendar))
+    return FALSE;
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+  if (!e_cal_util_component_has_organizer (icomp))
+    return TRUE;
+
+  addresses = gcal_rsvp_dup_user_addresses (manager, calendar);
+
+  return user_is_organizer (icomp, addresses);
+}
+
+/**
+ * gcal_rsvp_add_guest:
+ * @manager: a #GcalManager
+ * @event: the edited #GcalEvent
+ * @address: the guest's email address
+ * @name: (nullable): the guest's display name
+ *
+ * Adds a required attendee to @event, making the user its organizer if it has
+ * none yet.
+ *
+ * Returns: %TRUE if the guest was added, %FALSE if already invited
+ */
+gboolean
+gcal_rsvp_add_guest (GcalManager *manager,
+                     GcalEvent   *event,
+                     const gchar *address,
+                     const gchar *name)
+{
+  g_autoptr (GHashTable) guest = NULL;
+  g_autoptr (ICalProperty) existing = NULL;
+  g_autofree gchar *mailto = NULL;
+  ICalComponent *icomp;
+  ICalProperty *prop;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), FALSE);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), FALSE);
+  g_return_val_if_fail (address && *address, FALSE);
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+
+  guest = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_hash_table_add (guest, g_ascii_strdown (address, -1));
+
+  existing = find_user_attendee (icomp, guest);
+  if (existing)
+    return FALSE;
+
+  if (!e_cal_util_component_has_organizer (icomp))
+    {
+      const gchar *user_email = gcal_calendar_get_user_email (gcal_event_get_calendar (event));
+      g_autofree gchar *user_name = NULL;
+      g_autofree gchar *organizer_mailto = NULL;
+
+      if (user_email && *user_email)
+        {
+          user_name = dup_user_name (manager, user_email);
+          organizer_mailto = g_strconcat ("mailto:", user_email, NULL);
+
+          prop = i_cal_property_new_organizer (organizer_mailto);
+          if (user_name && *user_name)
+            i_cal_property_take_parameter (prop, i_cal_parameter_new_cn (user_name));
+          i_cal_component_take_property (icomp, prop);
+        }
+      else
+        {
+          g_warning ("Calendar has no user address; the backend will pick the organizer");
+        }
+    }
+
+  mailto = g_strconcat ("mailto:", address, NULL);
+  prop = i_cal_property_new_attendee (mailto);
+  if (name && *name)
+    i_cal_property_take_parameter (prop, i_cal_parameter_new_cn (name));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_cutype (I_CAL_CUTYPE_INDIVIDUAL));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_role (I_CAL_ROLE_REQPARTICIPANT));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_partstat (I_CAL_PARTSTAT_NEEDSACTION));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_rsvp (I_CAL_RSVP_TRUE));
+  i_cal_component_take_property (icomp, prop);
+
+  gcal_event_reload_attendees (event);
+
+  return TRUE;
+}
+
+/**
+ * gcal_rsvp_remove_guest:
+ * @manager: a #GcalManager
+ * @event: the edited #GcalEvent
+ * @address: the guest's email address
+ *
+ * Removes an attendee from @event. When the last attendee goes, the
+ * organizer goes too, turning the meeting back into a plain event.
+ */
+void
+gcal_rsvp_remove_guest (GcalManager *manager,
+                        GcalEvent   *event,
+                        const gchar *address)
+{
+  g_autoptr (GHashTable) guest = NULL;
+  g_autoptr (ICalProperty) attendee = NULL;
+  ICalComponent *icomp;
+
+  g_return_if_fail (GCAL_IS_MANAGER (manager));
+  g_return_if_fail (GCAL_IS_EVENT (event));
+  g_return_if_fail (address && *address);
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+
+  guest = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_hash_table_add (guest, g_ascii_strdown (address, -1));
+
+  attendee = find_user_attendee (icomp, guest);
+  if (!attendee)
+    return;
+
+  i_cal_component_remove_property (icomp, attendee);
+
+  if (count_attendees (icomp) == 0)
+    e_cal_util_component_remove_property_by_kind (icomp, I_CAL_ORGANIZER_PROPERTY, TRUE);
+
+  gcal_event_reload_attendees (event);
+}
+
+static GHashTable *
+dup_guest_set (GcalEvent *event)
+{
+  ICalComponent *icomp;
+  ICalProperty *prop;
+  GHashTable *set;
+
+  set = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+
+  for (prop = i_cal_component_get_first_property (icomp, I_CAL_ATTENDEE_PROPERTY);
+       prop;
+       g_object_unref (prop), prop = i_cal_component_get_next_property (icomp, I_CAL_ATTENDEE_PROPERTY))
+    {
+      const gchar *address = e_cal_util_strip_mailto (i_cal_property_get_attendee (prop));
+
+      if (address)
+        g_hash_table_add (set, g_ascii_strdown (address, -1));
+    }
+
+  return set;
+}
+
+/**
+ * gcal_rsvp_guests_equal:
+ * @event1: a #GcalEvent
+ * @event2: a #GcalEvent
+ *
+ * Returns: %TRUE if both events invite the same addresses
+ */
+gboolean
+gcal_rsvp_guests_equal (GcalEvent *event1,
+                        GcalEvent *event2)
+{
+  g_autoptr (GHashTable) set1 = NULL;
+  g_autoptr (GHashTable) set2 = NULL;
+  GHashTableIter iter;
+  gpointer key;
+
+  g_return_val_if_fail (GCAL_IS_EVENT (event1) && GCAL_IS_EVENT (event2), TRUE);
+
+  set1 = dup_guest_set (event1);
+  set2 = dup_guest_set (event2);
+
+  if (g_hash_table_size (set1) != g_hash_table_size (set2))
+    return FALSE;
+
+  g_hash_table_iter_init (&iter, set1);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      if (!g_hash_table_contains (set2, key))
+        return FALSE;
+    }
+
+  return TRUE;
+}

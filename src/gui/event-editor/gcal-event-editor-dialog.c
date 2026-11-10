@@ -30,6 +30,7 @@
 #include "gcal-event.h"
 #include "gcal-notes-section.h"
 #include "gcal-reminders-section.h"
+#include "gcal-rsvp.h"
 #include "gcal-schedule-section.h"
 #include "gcal-summary-section.h"
 #include "gcal-utils.h"
@@ -76,6 +77,11 @@ struct _GcalEventEditorDialog
 };
 
 G_DEFINE_TYPE (GcalEventEditorDialog, gcal_event_editor_dialog, ADW_TYPE_DIALOG)
+
+/* Fork */
+static void          on_calendar_combo_row_calendar_changed_cb   (GcalCalendarComboRow  *combo_row,
+                                                                  GParamSpec            *pspec,
+                                                                  GcalEventEditorDialog *self);
 
 enum
 {
@@ -165,8 +171,8 @@ set_event (GcalEventEditorDialog *self,
   gcal_calendar_combo_row_set_calendar (self->calendar_combo_row, calendar);
 
   set_writable (self, !gcal_calendar_is_read_only (calendar));
-  gboolean has_participants = gcal_event_get_organizer (self->edited_event) != NULL;
-  gtk_widget_set_visible (GTK_WIDGET (self->attendees_section), has_participants);
+  /* Fork: the attendees section decides its own visibility (it is also shown
+   * to add guests to events the user organizes) */
 
   gtk_widget_set_visible (self->cancel_button, self->writable);
 
@@ -264,6 +270,13 @@ set_up_context (GcalEventEditorDialog *self)
 
   adw_combo_row_set_model (ADW_COMBO_ROW (self->calendar_combo_row), G_LIST_MODEL (flatten_model));
 
+  /* Fork */
+  g_signal_connect_object (self->calendar_combo_row,
+                           "notify::calendar",
+                           G_CALLBACK (on_calendar_combo_row_calendar_changed_cb),
+                           self,
+                           G_CONNECT_DEFAULT);
+
   GCAL_EXIT;
 }
 
@@ -288,7 +301,9 @@ save_event (GcalEventEditorDialog *self,
   alarms_equal = gcal_event_alarms_equal (self->event, self->edited_event);
   schedule_equal = gcal_event_schedule_equal (self->event, self->edited_event);
   strings_equal = gcal_event_strings_equal (self->event, self->edited_event);
-  event_equal = calendar_equal && alarms_equal && schedule_equal && strings_equal;
+  /* Fork: changed guests must be saved too */
+  event_equal = calendar_equal && alarms_equal && schedule_equal && strings_equal &&
+                gcal_rsvp_guests_equal (self->event, self->edited_event);
 
   if (self->event_is_new)
     {
@@ -355,6 +370,23 @@ on_show_attendees_detail_page_action_activated_cb (GtkWidget  *widget,
 
   adw_navigation_view_push (ADW_NAVIGATION_VIEW (self->nav_view),
                             ADW_NAVIGATION_PAGE (self->attendee_details_page));
+}
+
+/* Fork: a new event belongs to the picked calendar right away, so the guests
+ * section knows whether that calendar can send invitations */
+static void
+on_calendar_combo_row_calendar_changed_cb (GcalCalendarComboRow  *combo_row,
+                                           GParamSpec            *pspec,
+                                           GcalEventEditorDialog *self)
+{
+  GcalCalendar *calendar = gcal_calendar_combo_row_get_calendar (combo_row);
+
+  if (!self->event_is_new || !self->edited_event || !calendar ||
+      calendar == gcal_event_get_calendar (self->edited_event))
+    return;
+
+  gcal_event_set_calendar (self->edited_event, calendar);
+  gcal_attendees_section_refresh (GCAL_ATTENDEES_SECTION (self->attendees_section));
 }
 
 /* Fork: lets sections close the dialog, e.g. after declining an invitation */
