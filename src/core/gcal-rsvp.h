@@ -51,4 +51,19 @@ GcalEvent*           gcal_rsvp_dup_event_with_user_status        (GcalManager   
                                                                   GcalEvent                 *event,
                                                                   GcalEventAttendeePartStat  status);
 
+gboolean             gcal_rsvp_can_edit_guests                   (GcalManager               *manager,
+                                                                  GcalEvent                 *event);
+
+gboolean             gcal_rsvp_add_guest                         (GcalManager               *manager,
+                                                                  GcalEvent                 *event,
+                                                                  const gchar               *address,
+                                                                  const gchar               *name);
+
+void                 gcal_rsvp_remove_guest                      (GcalManager               *manager,
+                                                                  GcalEvent                 *event,
+                                                                  const gchar               *address);
+
+gboolean             gcal_rsvp_guests_equal                      (GcalEvent                 *event1,
+                                                                  GcalEvent                 *event2);
+
 G_END_DECLS

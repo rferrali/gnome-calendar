@@ -36,4 +36,9 @@ guint                gcal_guest_list_get_n_guests                (GcalGuestList 
 
 const gchar*         gcal_guest_list_get_summary                 (GcalGuestList      *self);
 
+void                 gcal_guest_list_set_editable                (GcalGuestList      *self,
+                                                                  gboolean            editable);
+
+void                 gcal_guest_list_focus_add_row               (GcalGuestList      *self);
+
 G_END_DECLS

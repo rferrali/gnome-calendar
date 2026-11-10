@@ -45,6 +45,8 @@ struct _GcalGuestList
   GtkBox              parent_instance;
 
   GtkListBox         *list;
+  gboolean            editable;
+  GtkWidget          *add_row;
   guint               n_guests;
   gchar              *summary;
 };
@@ -59,7 +61,15 @@ enum
   N_PROPS
 };
 
+enum
+{
+  ADD_GUEST,
+  REMOVE_GUEST,
+  N_SIGNALS
+};
+
 static GParamSpec *properties[N_PROPS] = { NULL, };
+static guint signals[N_SIGNALS] = { 0, };
 
 typedef enum
 {
@@ -177,8 +187,64 @@ status_icon (const Guest  *guest,
     }
 }
 
+static void
+on_remove_button_clicked_cb (GtkButton     *button,
+                             GcalGuestList *self)
+{
+  const gchar *address = g_object_get_data (G_OBJECT (button), "guest-address");
+
+  g_signal_emit (self, signals[REMOVE_GUEST], 0, address);
+}
+
+static void
+on_add_guest_cb (AdwEntryRow   *entry_row,
+                 GcalGuestList *self)
+{
+  g_autofree gchar *address = NULL;
+
+  address = g_strstrip (g_strdup (gtk_editable_get_text (GTK_EDITABLE (entry_row))));
+  if (!address || !*address)
+    return;
+
+  /* Accept "Name <address>" as well as a bare address */
+  if (strchr (address, '<') && strchr (address, '>'))
+    {
+      g_autofree gchar *inner = g_strndup (strchr (address, '<') + 1,
+                                           strchr (address, '>') - strchr (address, '<') - 1);
+      g_free (address);
+      address = g_strstrip (g_steal_pointer (&inner));
+    }
+
+  if (!strchr (address, '@') || strchr (address, ' '))
+    {
+      gtk_widget_add_css_class (GTK_WIDGET (entry_row), "error");
+      return;
+    }
+
+  gtk_widget_remove_css_class (GTK_WIDGET (entry_row), "error");
+  g_signal_emit (self, signals[ADD_GUEST], 0, address);
+}
+
 static GtkWidget *
-create_row (const Guest *guest)
+create_add_row (GcalGuestList *self)
+{
+  GtkWidget *row;
+
+  row = adw_entry_row_new ();
+  adw_preferences_row_set_title (ADW_PREFERENCES_ROW (row), _("Add Guest"));
+  adw_entry_row_set_show_apply_button (ADW_ENTRY_ROW (row), TRUE);
+  adw_entry_row_set_input_purpose (ADW_ENTRY_ROW (row), GTK_INPUT_PURPOSE_EMAIL);
+  gtk_widget_set_tooltip_text (row, _("Type an email address and press Enter"));
+
+  g_signal_connect (row, "apply", G_CALLBACK (on_add_guest_cb), self);
+  g_signal_connect (row, "entry-activated", G_CALLBACK (on_add_guest_cb), self);
+
+  return row;
+}
+
+static GtkWidget *
+create_row (GcalGuestList *self,
+            const Guest   *guest)
 {
   g_autoptr (GPtrArray) tags = NULL;
   const gchar *icon_name, *css_class, *tooltip;
@@ -232,6 +298,20 @@ create_row (const Guest *guest)
       gtk_widget_add_css_class (label, "dimmed");
       gtk_widget_add_css_class (label, "caption");
       adw_action_row_add_suffix (ADW_ACTION_ROW (row), label);
+    }
+
+  if (self->editable && !guest->is_organizer && guest->address)
+    {
+      GtkWidget *button;
+
+      button = gtk_button_new_from_icon_name ("window-close-symbolic");
+      gtk_widget_set_valign (button, GTK_ALIGN_CENTER);
+      gtk_widget_set_tooltip_text (button, _("Remove Guest"));
+      gtk_widget_add_css_class (button, "flat");
+      gtk_widget_add_css_class (button, "circular");
+      g_object_set_data_full (G_OBJECT (button), "guest-address", g_strdup (guest->address), g_free);
+      g_signal_connect (button, "clicked", G_CALLBACK (on_remove_button_clicked_cb), self);
+      adw_action_row_add_suffix (ADW_ACTION_ROW (row), button);
     }
 
   return row;
@@ -365,6 +445,34 @@ gcal_guest_list_class_init (GcalGuestListClass *klass)
                                                   G_PARAM_READABLE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS);
 
   g_object_class_install_properties (object_class, N_PROPS, properties);
+
+  /**
+   * GcalGuestList::remove-guest:
+   * @address: the guest's email address
+   *
+   * Emitted when the remove button of a guest is clicked (editable lists only).
+   */
+  /**
+   * GcalGuestList::add-guest:
+   * @address: the email address typed in the "Add Guest" row
+   *
+   * Emitted when a guest is added (editable lists only).
+   */
+  signals[ADD_GUEST] = g_signal_new ("add-guest",
+                                     GCAL_TYPE_GUEST_LIST,
+                                     G_SIGNAL_RUN_LAST,
+                                     0, NULL, NULL, NULL,
+                                     G_TYPE_NONE,
+                                     1,
+                                     G_TYPE_STRING);
+
+  signals[REMOVE_GUEST] = g_signal_new ("remove-guest",
+                                        GCAL_TYPE_GUEST_LIST,
+                                        G_SIGNAL_RUN_LAST,
+                                        0, NULL, NULL, NULL,
+                                        G_TYPE_NONE,
+                                        1,
+                                        G_TYPE_STRING);
 }
 
 static void
@@ -407,6 +515,7 @@ gcal_guest_list_set_event (GcalGuestList *self,
   g_return_if_fail (GCAL_IS_GUEST_LIST (self));
 
   gtk_list_box_remove_all (self->list);
+  self->add_row = NULL;
 
   if (!event)
     {
@@ -477,7 +586,13 @@ gcal_guest_list_set_event (GcalGuestList *self,
   g_ptr_array_sort (guests, compare_guests);
 
   for (guint i = 0; i < guests->len; i++)
-    gtk_list_box_append (self->list, create_row (g_ptr_array_index (guests, i)));
+    gtk_list_box_append (self->list, create_row (self, g_ptr_array_index (guests, i)));
+
+  if (self->editable)
+    {
+      self->add_row = create_add_row (self);
+      gtk_list_box_append (self->list, self->add_row);
+    }
 
   summary = build_summary (guests);
   set_counts (self, guests->len, summary);
@@ -497,4 +612,35 @@ gcal_guest_list_get_summary (GcalGuestList *self)
   g_return_val_if_fail (GCAL_IS_GUEST_LIST (self), NULL);
 
   return self->summary;
+}
+
+/**
+ * gcal_guest_list_set_editable:
+ * @self: a #GcalGuestList
+ * @editable: whether guests can be removed
+ *
+ * Takes effect on the next gcal_guest_list_set_event().
+ */
+void
+gcal_guest_list_set_editable (GcalGuestList *self,
+                              gboolean       editable)
+{
+  g_return_if_fail (GCAL_IS_GUEST_LIST (self));
+
+  self->editable = editable;
+}
+
+/**
+ * gcal_guest_list_focus_add_row:
+ * @self: a #GcalGuestList
+ *
+ * Moves the keyboard focus to the "Add Guest" row, if any.
+ */
+void
+gcal_guest_list_focus_add_row (GcalGuestList *self)
+{
+  g_return_if_fail (GCAL_IS_GUEST_LIST (self));
+
+  if (self->add_row)
+    gtk_widget_grab_focus (self->add_row);
 }
