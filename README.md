@@ -1,3 +1,9 @@
+> [!WARNING]
+> **Personal fork. Not maintained for anyone but me.**
+> This is my own copy of [GNOME Calendar](https://gitlab.gnome.org/GNOME/gnome-calendar) with a few small, AI-assisted changes for my own setup. Use upstream instead.
+> Issues are off and I won't review pull requests. If anything here is useful, especially to upstream, feel free to take it.
+> My changes live on the `mine` branch, on top of upstream `main`: [see the diff](https://github.com/rferrali/gnome-calendar/compare/e7f284ae2770b1e546727b0526f7420a242c9b28...mine).
+
 <div align="center">
   <img src="data/icons/hicolor/scalable/apps/org.gnome.Calendar.svg" width="128" height="128">
 
