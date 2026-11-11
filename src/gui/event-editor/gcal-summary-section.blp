@@ -12,5 +12,19 @@ template $GcalSummarySection: $GcalEventEditorSection {
     title: _("Location");
     notify::text => $on_location_entry_changed_cb(template);
     editable: bind template.dialog as <$GcalEventEditorDialog>.writable;
+
+    /* Fork: puts the meeting-room-url setting in an empty Location */
+    [suffix]
+    Button meeting_room_button {
+      icon-name: "camera-video-symbolic";
+      tooltip-text: _("Add Meeting Room");
+      valign: center;
+      visible: false;
+      clicked => $on_meeting_room_button_clicked_cb(template) not-swapped;
+
+      styles [
+        "flat",
+      ]
+    }
   }
 }

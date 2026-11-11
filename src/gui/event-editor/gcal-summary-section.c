@@ -20,6 +20,8 @@
 
 #define G_LOG_DOMAIN "GcalSummarySection"
 
+#include "gcal-application.h"
+#include "gcal-context.h"
 #include "gcal-debug.h"
 #include "gcal-summary-section.h"
 #include "gcal-utils.h"
@@ -32,10 +34,47 @@ struct _GcalSummarySection
 
   AdwEntryRow            *summary_entry;
   AdwEntryRow            *location_entry;
+  GtkWidget              *meeting_room_button;
 };
 
 
 G_DEFINE_FINAL_TYPE (GcalSummarySection, gcal_summary_section, GCAL_TYPE_EVENT_EDITOR_SECTION)
+
+/*
+ * Fork: meeting room
+ */
+
+static gchar *
+dup_meeting_room_url (void)
+{
+  GSettings *settings = gcal_context_get_settings (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+
+  return g_settings_get_string (settings, "meeting-room-url");
+}
+
+/* Offered only when a link is configured and Location is empty and editable */
+static void
+update_meeting_room_button (GcalSummarySection *self)
+{
+  g_autofree gchar *url = dup_meeting_room_url ();
+  const gchar *location = gtk_editable_get_text (GTK_EDITABLE (self->location_entry));
+
+  gtk_widget_set_visible (self->meeting_room_button,
+                          url && *url &&
+                          (!location || !*location) &&
+                          gtk_editable_get_editable (GTK_EDITABLE (self->location_entry)));
+}
+
+static void
+on_meeting_room_button_clicked_cb (GtkButton          *button,
+                                   GcalSummarySection *self)
+{
+  g_autofree gchar *url = dup_meeting_room_url ();
+
+  if (url && *url)
+    gtk_editable_set_text (GTK_EDITABLE (self->location_entry), url);
+}
+
 
 /*
  * Callbacks
@@ -76,6 +115,8 @@ on_location_entry_changed_cb (GcalSummarySection *self)
   event = gcal_event_editor_section_get_event (GCAL_EVENT_EDITOR_SECTION (self));
 
   gcal_event_set_location (event, text);
+
+  update_meeting_room_button (self);
 }
 
 
@@ -107,6 +148,8 @@ gcal_summary_section_event_set_cb (GcalEventEditorSection *section,
   g_signal_handlers_unblock_by_func (self->location_entry, on_location_entry_changed_cb, self);
 
   gtk_widget_remove_css_class (GTK_WIDGET (self->summary_entry), "error");
+
+  update_meeting_room_button (self);
 }
 
 
@@ -151,10 +194,12 @@ gcal_summary_section_class_init (GcalSummarySectionClass *klass)
   gtk_widget_class_set_template_from_resource (widget_class, "/org/gnome/calendar/ui/event-editor/gcal-summary-section.ui");
 
   gtk_widget_class_bind_template_child (widget_class, GcalSummarySection, location_entry);
+  gtk_widget_class_bind_template_child (widget_class, GcalSummarySection, meeting_room_button);
   gtk_widget_class_bind_template_child (widget_class, GcalSummarySection, summary_entry);
 
   gtk_widget_class_bind_template_callback (widget_class, on_summary_entry_text_changed_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_location_entry_changed_cb);
+  gtk_widget_class_bind_template_callback (widget_class, on_meeting_room_button_clicked_cb);
 }
 
 static void

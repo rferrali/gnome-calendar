@@ -26,5 +26,11 @@
       <summary>Zoom level of the week grid</summary>
       <description>The current zoom level of the week grid</description>
     </key>
+    <!-- Fork: no UI, set with gsettings -->
+    <key name="meeting-room-url" type="s">
+      <default>''</default>
+      <summary>Meeting room link</summary>
+      <description>Link the event editor's “Add Meeting Room” button puts in an empty Location. Empty hides the button.</description>
+    </key>
   </schema>
 </schemalist>
