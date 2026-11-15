@@ -6,7 +6,8 @@
 #   ./local-build.sh run      build + install + run
 #
 # Generates a copy of the upstream manifest with evolution-data-server pinned to
-# the host's release (instead of git main) and tests disabled.
+# the host's release (instead of git main), tests disabled, and read access to
+# Stamp's mail cache (guest suggestions from the mail history).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -15,7 +16,8 @@ eds_tag=3.62.0
 mkdir -p "$out"
 jq --arg eds "$eds_tag" '
     (.modules[] | select(.name == "evolution-data-server") | .sources[0]) += {"tag": $eds}
-  | (.modules[] | select(.name == "gnome-calendar")) |= (del(."run-tests"))' \
+  | (.modules[] | select(.name == "gnome-calendar")) |= (del(."run-tests"))
+  | ."finish-args" += ["--filesystem=~/.var/app/org.tabos.stamp/cache/stamp:ro"]' \
   build-aux/org.gnome.Calendar.json > "$out/org.gnome.Calendar.local.json"
 
 flatpak-builder --user --install --force-clean --ccache \
