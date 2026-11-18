@@ -2016,3 +2016,30 @@ gcal_event_get_organizer (GcalEvent *self)
 
   return self->organizer;
 }
+
+/**
+ * gcal_event_reload_attendees:
+ * @self: a #GcalEvent
+ *
+ * Fork addition. Reloads the organizer and the attendees list from the
+ * component, after the component's ORGANIZER / ATTENDEE properties were
+ * changed directly.
+ */
+void
+gcal_event_reload_attendees (GcalEvent *self)
+{
+  ECalComponentOrganizer *organizer;
+
+  g_return_if_fail (GCAL_IS_EVENT (self));
+
+  g_clear_object (&self->organizer);
+
+  organizer = e_cal_component_get_organizer (self->component);
+  if (organizer)
+    self->organizer = gcal_event_organizer_new (organizer);
+  e_cal_component_organizer_free (organizer);
+
+  g_list_store_remove_all (self->attendees);
+  if (e_cal_component_has_attendees (self->component))
+    load_attendees (self);
+}

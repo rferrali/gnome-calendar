@@ -163,6 +163,10 @@ gsettings_desktop_schemas_dep = dependency('gsettings-desktop-schemas', version:
 libedataserverui_dep = dependency('libedataserverui4-1.0', version: '>= 3.45.1')
 libedataserver_dep = dependency('libedataserver-1.2', version: '>= 3.45.1')
 libecal_dep = dependency('libecal-2.0', version: '>= 3.45.1')
+# Fork: guest suggestions from address books and Stamp's mail cache
+libebook_dep = dependency('libebook-1.2', version: '>= 3.45.1')
+camel_dep = dependency('camel-1.2', version: '>= 3.45.1')
+sqlite_dep = dependency('sqlite3')
 libsoup_dep = dependency('libsoup-3.0')
 libadwaita_dep = dependency('libadwaita-1', version: '>= 1.8.alpha')
 fribidi_dep = dependency('fribidi')

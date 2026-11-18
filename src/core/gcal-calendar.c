@@ -31,6 +31,7 @@ typedef struct
   ESource            *source;
   ESource            *parent_source;
   ECalClient         *client;
+  gchar              *user_email;
 
   gboolean            read_only;
   gboolean            visible;
@@ -311,6 +312,18 @@ gcal_calendar_initable_init (GInitable     *initable,
                                                         self);
 
   g_assert (E_IS_CAL_CLIENT (client));
+
+  /* Fork: the address the backend uses for the user (needed to reply to invitations) */
+  if (!e_client_get_backend_property_sync (client,
+                                           E_CAL_BACKEND_PROPERTY_CAL_EMAIL_ADDRESS,
+                                           &priv->user_email,
+                                           cancellable,
+                                           &local_error))
+    {
+      g_debug ("No user email for calendar %s: %s", e_source_get_uid (priv->source), local_error->message);
+      g_clear_error (&local_error);
+    }
+
   priv->client = (ECalClient*) g_steal_pointer (&client);
 
   GCAL_RETURN (TRUE);
@@ -346,6 +359,7 @@ gcal_calendar_finalize (GObject *object)
   g_mutex_unlock (&priv->shared.mutex);
 
   g_clear_object (&priv->client);
+  g_clear_pointer (&priv->user_email, g_free);
   g_clear_object (&priv->source);
   g_clear_object (&priv->parent_source);
 
@@ -799,3 +813,22 @@ gcal_calendar_set_visible (GcalCalendar *self,
   save_calendar (self);
 }
 
+/**
+ * gcal_calendar_get_user_email:
+ * @self: a #GcalCalendar
+ *
+ * Fork addition. Retrieves the address the calendar backend reports for the
+ * user (E_CAL_BACKEND_PROPERTY_CAL_EMAIL_ADDRESS), if any.
+ *
+ * Returns: (nullable): the user's address for this calendar
+ */
+const gchar*
+gcal_calendar_get_user_email (GcalCalendar *self)
+{
+  GcalCalendarPrivate *priv;
+
+  g_return_val_if_fail (GCAL_IS_CALENDAR (self), NULL);
+
+  priv = gcal_calendar_get_instance_private (self);
+  return priv->user_email;
+}

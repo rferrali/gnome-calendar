@@ -30,6 +30,7 @@
 #include "gcal-event.h"
 #include "gcal-notes-section.h"
 #include "gcal-reminders-section.h"
+#include "gcal-rsvp.h"
 #include "gcal-schedule-section.h"
 #include "gcal-summary-section.h"
 #include "gcal-utils.h"
@@ -76,6 +77,11 @@ struct _GcalEventEditorDialog
 };
 
 G_DEFINE_TYPE (GcalEventEditorDialog, gcal_event_editor_dialog, ADW_TYPE_DIALOG)
+
+/* Fork */
+static void          on_calendar_combo_row_calendar_changed_cb   (GcalCalendarComboRow  *combo_row,
+                                                                  GParamSpec            *pspec,
+                                                                  GcalEventEditorDialog *self);
 
 enum
 {
@@ -165,8 +171,8 @@ set_event (GcalEventEditorDialog *self,
   gcal_calendar_combo_row_set_calendar (self->calendar_combo_row, calendar);
 
   set_writable (self, !gcal_calendar_is_read_only (calendar));
-  gboolean has_participants = gcal_event_get_organizer (self->edited_event) != NULL;
-  gtk_widget_set_visible (GTK_WIDGET (self->attendees_section), has_participants);
+  /* Fork: the attendees section decides its own visibility (it is also shown
+   * to add guests to events the user organizes) */
 
   gtk_widget_set_visible (self->cancel_button, self->writable);
 
@@ -185,7 +191,8 @@ static void
 clear_and_hide_dialog (GcalEventEditorDialog *self)
 {
   set_event (self, NULL, FALSE);
-  adw_dialog_close (ADW_DIALOG (self));
+  /* Fork: can-close is FALSE so unsaved changes can be confirmed */
+  adw_dialog_force_close (ADW_DIALOG (self));
 }
 
 static void
@@ -235,6 +242,9 @@ apply_event_properties_to_template_event (GcalEvent *template_event,
       if (alarm)
         gcal_event_add_alarm (template_event, alarm);
     }
+
+  /* Fork: guest changes apply to the whole series too */
+  gcal_rsvp_copy_guests (event, template_event);
 }
 
 static void
@@ -264,6 +274,13 @@ set_up_context (GcalEventEditorDialog *self)
 
   adw_combo_row_set_model (ADW_COMBO_ROW (self->calendar_combo_row), G_LIST_MODEL (flatten_model));
 
+  /* Fork */
+  g_signal_connect_object (self->calendar_combo_row,
+                           "notify::calendar",
+                           G_CALLBACK (on_calendar_combo_row_calendar_changed_cb),
+                           self,
+                           G_CONNECT_DEFAULT);
+
   GCAL_EXIT;
 }
 
@@ -288,7 +305,9 @@ save_event (GcalEventEditorDialog *self,
   alarms_equal = gcal_event_alarms_equal (self->event, self->edited_event);
   schedule_equal = gcal_event_schedule_equal (self->event, self->edited_event);
   strings_equal = gcal_event_strings_equal (self->event, self->edited_event);
-  event_equal = calendar_equal && alarms_equal && schedule_equal && strings_equal;
+  /* Fork: changed guests must be saved too */
+  event_equal = calendar_equal && alarms_equal && schedule_equal && strings_equal &&
+                gcal_rsvp_guests_equal (self->event, self->edited_event);
 
   if (self->event_is_new)
     {
@@ -325,6 +344,158 @@ save_event (GcalEventEditorDialog *self,
 
 
 /*
+ * Fork: confirmations
+ */
+
+static gboolean
+has_unsaved_changes (GcalEventEditorDialog *self)
+{
+  GcalCalendar *selected_calendar;
+
+  if (!self->event || !self->edited_event || !self->writable)
+    return FALSE;
+
+  selected_calendar = gcal_calendar_combo_row_get_calendar (self->calendar_combo_row);
+
+  return (selected_calendar && selected_calendar != gcal_event_get_calendar (self->event)) ||
+         !gcal_event_alarms_equal (self->event, self->edited_event) ||
+         !gcal_event_schedule_equal (self->event, self->edited_event) ||
+         !gcal_event_strings_equal (self->event, self->edited_event) ||
+         !gcal_rsvp_guests_equal (self->event, self->edited_event);
+}
+
+/* Saving will email guests: a meeting the user organizes, with changes to save */
+static gboolean
+save_will_email_guests (GcalEventEditorDialog *self)
+{
+  GcalManager *manager;
+  GcalCalendar *selected_calendar;
+
+  if (!self->writable || !self->edited_event ||
+      !e_cal_component_has_attendees (gcal_event_get_component (self->edited_event)))
+    return FALSE;
+
+  /* Moving to another calendar sends nothing */
+  selected_calendar = gcal_calendar_combo_row_get_calendar (self->calendar_combo_row);
+  if (!self->event_is_new && selected_calendar && selected_calendar != gcal_event_get_calendar (self->event))
+    return FALSE;
+
+  if (!self->event_is_new && !has_unsaved_changes (self))
+    return FALSE;
+
+  manager = gcal_context_get_manager (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+
+  return gcal_rsvp_can_edit_guests (manager, self->edited_event);
+}
+
+static void
+do_save (GcalEventEditorDialog *self)
+{
+  GcalCalendar *calendar = gcal_event_get_calendar (self->edited_event);
+
+  if (gcal_calendar_is_read_only (calendar) || save_event (self, calendar))
+    clear_and_hide_dialog (self);
+}
+
+static void
+on_send_confirmation_response_cb (AdwAlertDialog        *dialog,
+                                  const gchar           *response,
+                                  GcalEventEditorDialog *self)
+{
+  if (g_strcmp0 (response, "send") == 0)
+    do_save (self);
+  /* otherwise cancelled: keep editing */
+}
+
+static void
+ask_send_confirmation (GcalEventEditorDialog *self)
+{
+  g_autoptr (GPtrArray) lines = NULL;
+  g_autofree gchar *body = NULL;
+  guint added, removed, kept;
+  AdwDialog *dialog;
+
+  gcal_rsvp_count_guest_changes (self->event_is_new ? NULL : self->event,
+                                 self->edited_event,
+                                 &added, &removed, &kept);
+
+  lines = g_ptr_array_new_with_free_func (g_free);
+
+  if (added > 0)
+    g_ptr_array_add (lines, g_strdup_printf (g_dngettext (GETTEXT_PACKAGE,
+                                                          "%u new guest will be invited.",
+                                                          "%u new guests will be invited.",
+                                                          added), added));
+  if (kept > 0)
+    g_ptr_array_add (lines, g_strdup_printf (g_dngettext (GETTEXT_PACKAGE,
+                                                          "%u guest will be told about the changes.",
+                                                          "%u guests will be told about the changes.",
+                                                          kept), kept));
+  if (removed > 0)
+    g_ptr_array_add (lines, g_strdup_printf (g_dngettext (GETTEXT_PACKAGE,
+                                                          "%u removed guest will be told they are no longer invited.",
+                                                          "%u removed guests will be told they are no longer invited.",
+                                                          removed), removed));
+  g_ptr_array_add (lines, NULL);
+  body = g_strjoinv ("\n", (gchar **) lines->pdata);
+
+  dialog = adw_alert_dialog_new (self->event_is_new ? _("Send Invitations?") : _("Send Updates to Guests?"), body);
+  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dialog),
+                                  "cancel", _("_Cancel"),
+                                  "send", _("_Send"),
+                                  NULL);
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dialog), "send", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dialog), "send");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "cancel");
+
+  g_signal_connect_object (dialog, "response", G_CALLBACK (on_send_confirmation_response_cb), self, G_CONNECT_DEFAULT);
+  adw_dialog_present (dialog, GTK_WIDGET (self));
+}
+
+static void
+on_discard_confirmation_response_cb (AdwAlertDialog        *dialog,
+                                     const gchar           *response,
+                                     GcalEventEditorDialog *self)
+{
+  if (g_strcmp0 (response, "discard") == 0)
+    clear_and_hide_dialog (self);
+}
+
+/* Cancel, Escape and the close button all end up here */
+static void
+close_with_confirmation (GcalEventEditorDialog *self)
+{
+  AdwDialog *dialog;
+
+  if (!has_unsaved_changes (self))
+    {
+      clear_and_hide_dialog (self);
+      return;
+    }
+
+  dialog = adw_alert_dialog_new (_("Discard Changes?"),
+                                 _("Your unsaved changes to this event will be lost."));
+  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dialog),
+                                  "keep", _("_Keep Editing"),
+                                  "discard", _("_Discard"),
+                                  NULL);
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dialog), "discard", ADW_RESPONSE_DESTRUCTIVE);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dialog), "keep");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "keep");
+
+  g_signal_connect_object (dialog, "response", G_CALLBACK (on_discard_confirmation_response_cb), self, G_CONNECT_DEFAULT);
+  adw_dialog_present (dialog, GTK_WIDGET (self));
+}
+
+static void
+on_close_attempt_cb (AdwDialog             *dialog,
+                     GcalEventEditorDialog *self)
+{
+  close_with_confirmation (self);
+}
+
+
+/*
  * Callbacks
  */
 
@@ -334,10 +505,15 @@ on_event_editor_save_action_activated_cb (GtkWidget  *widget,
                                           GVariant   *param)
 {
   GcalEventEditorDialog *self = GCAL_EVENT_EDITOR_DIALOG (widget);
-  GcalCalendar *calendar = gcal_event_get_calendar (self->edited_event);
 
-  if (gcal_calendar_is_read_only (calendar) || save_event (self, calendar))
-    clear_and_hide_dialog (self);
+  /* Fork: confirm before emailing guests */
+  if (save_will_email_guests (self))
+    {
+      ask_send_confirmation (self);
+      return;
+    }
+
+  do_save (self);
 }
 
 static void
@@ -357,13 +533,40 @@ on_show_attendees_detail_page_action_activated_cb (GtkWidget  *widget,
                             ADW_NAVIGATION_PAGE (self->attendee_details_page));
 }
 
+/* Fork: a new event belongs to the picked calendar right away, so the guests
+ * section knows whether that calendar can send invitations */
+static void
+on_calendar_combo_row_calendar_changed_cb (GcalCalendarComboRow  *combo_row,
+                                           GParamSpec            *pspec,
+                                           GcalEventEditorDialog *self)
+{
+  GcalCalendar *calendar = gcal_calendar_combo_row_get_calendar (combo_row);
+
+  if (!self->event_is_new || !self->edited_event || !calendar ||
+      calendar == gcal_event_get_calendar (self->edited_event))
+    return;
+
+  gcal_event_set_calendar (self->edited_event, calendar);
+  gcal_attendees_section_refresh (GCAL_ATTENDEES_SECTION (self->attendees_section));
+}
+
+/* Fork: lets sections close the dialog, e.g. after declining an invitation */
+static void
+on_event_editor_close_action_activated_cb (GtkWidget  *widget,
+                                           const char *action_name,
+                                           GVariant   *param)
+{
+  clear_and_hide_dialog (GCAL_EVENT_EDITOR_DIALOG (widget));
+}
+
 static void
 on_cancel_button_clicked_cb (GtkButton             *button,
                              GcalEventEditorDialog *self)
 {
   GCAL_ENTRY;
 
-  clear_and_hide_dialog (self);
+  /* Fork: confirm before throwing edits away */
+  close_with_confirmation (self);
 
   GCAL_EXIT;
 }
@@ -636,6 +839,7 @@ gcal_event_editor_dialog_class_init (GcalEventEditorDialogClass *klass)
   gtk_widget_class_bind_template_callback (widget_class, on_delete_row_activated_cb);
 
   gtk_widget_class_install_action (widget_class, "event-editor.save", NULL, on_event_editor_save_action_activated_cb);
+  gtk_widget_class_install_action (widget_class, "event-editor.close", NULL, on_event_editor_close_action_activated_cb);
   gtk_widget_class_install_action (widget_class, "event-editor.show-attendees-detail-page", "u",
                                    on_show_attendees_detail_page_action_activated_cb);
 }
@@ -644,6 +848,10 @@ static void
 gcal_event_editor_dialog_init (GcalEventEditorDialog *self)
 {
   gtk_widget_init_template (GTK_WIDGET (self));
+
+  /* Fork: confirm before throwing edits away (Escape, close button) */
+  adw_dialog_set_can_close (ADW_DIALOG (self), FALSE);
+  g_signal_connect (self, "close-attempt", G_CALLBACK (on_close_attempt_cb), self);
 
   set_up_context (self);
 

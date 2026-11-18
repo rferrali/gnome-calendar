@@ -1,0 +1,848 @@
+/* gcal-rsvp.c
+ *
+ * Local fork addition (not upstream): reply to meeting invitations.
+ *
+ * A reply is sent the way Evolution does it: the event, with the user's own
+ * ATTENDEE PARTSTAT changed, is wrapped in a METHOD:REQUEST VCALENDAR and
+ * handed to e_cal_client_receive_objects(). Backends that schedule on the
+ * server turn that into a real response; evolution-ews, for instance, issues
+ * Exchange AcceptItem / TentativelyAcceptItem / DeclineItem, which emails the
+ * organizer when the invitation asked for replies (RSVP=TRUE) unless
+ * E_CAL_OPERATION_FLAG_DISABLE_ITIP_MESSAGE is passed.
+ *
+ * A plain e_cal_client_modify_object() is NOT enough: on EWS, an attendee's
+ * modification is saved with SendToNone and the organizer never hears of it.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#define G_LOG_DOMAIN "GcalRsvp"
+
+#include "gcal-rsvp.h"
+
+#include "gcal-calendar.h"
+#include "gcal-debug.h"
+
+/* libical-glib ships no autoptr definitions */
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (ICalComponent, g_object_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (ICalProperty, g_object_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (ICalParameter, g_object_unref)
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (ECalComponent, g_object_unref)
+
+typedef struct
+{
+  GcalCalendar          *calendar;
+  ICalComponent         *icomp;
+  GHashTable            *user_addresses;
+  ICalParameterPartstat  partstat;
+  gboolean               whole_series;
+  gboolean               notify_organizer;
+} RespondData;
+
+static void
+respond_data_free (RespondData *data)
+{
+  g_clear_object (&data->calendar);
+  g_clear_object (&data->icomp);
+  g_clear_pointer (&data->user_addresses, g_hash_table_unref);
+  g_free (data);
+}
+
+static void
+add_address (GHashTable  *addresses,
+             const gchar *address)
+{
+  address = e_cal_util_strip_mailto (address);
+
+  if (address && *address)
+    g_hash_table_add (addresses, g_ascii_strdown (address, -1));
+}
+
+/*
+ * The user's addresses: the one the calendar backend reports for this calendar
+ * (cal-email-address, e.g. the Exchange account address), plus every mail
+ * identity address and alias.
+ */
+GHashTable *
+gcal_rsvp_dup_user_addresses (GcalManager  *manager,
+                              GcalCalendar *calendar)
+{
+  g_autolist (ESource) identities = NULL;
+  ESourceRegistry *registry;
+  GHashTable *addresses;
+
+  addresses = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+  add_address (addresses, gcal_calendar_get_user_email (calendar));
+
+  registry = gcal_manager_get_source_registry (manager);
+  if (!registry)
+    return addresses;
+
+  identities = e_source_registry_list_enabled (registry, E_SOURCE_EXTENSION_MAIL_IDENTITY);
+
+  for (GList *l = identities; l; l = l->next)
+    {
+      g_autoptr (GHashTable) aliases = NULL;
+      ESourceMailIdentity *identity;
+      GHashTableIter iter;
+      gpointer key;
+
+      identity = e_source_get_extension (l->data, E_SOURCE_EXTENSION_MAIL_IDENTITY);
+      add_address (addresses, e_source_mail_identity_get_address (identity));
+
+      aliases = e_source_mail_identity_get_aliases_as_hash_table (identity);
+      if (!aliases)
+        continue;
+
+      g_hash_table_iter_init (&iter, aliases);
+      while (g_hash_table_iter_next (&iter, &key, NULL))
+        add_address (addresses, key);
+    }
+
+  return addresses;
+}
+
+gboolean
+gcal_rsvp_is_user_address (GHashTable  *addresses,
+                           const gchar *address)
+{
+  g_autofree gchar *lower = NULL;
+
+  address = e_cal_util_strip_mailto (address);
+  if (!address || !*address)
+    return FALSE;
+
+  lower = g_ascii_strdown (address, -1);
+
+  return g_hash_table_contains (addresses, lower);
+}
+
+static gboolean
+user_is_organizer (ICalComponent *icomp,
+                   GHashTable    *addresses)
+{
+  g_autoptr (ICalProperty) organizer = NULL;
+
+  organizer = i_cal_component_get_first_property (icomp, I_CAL_ORGANIZER_PROPERTY);
+
+  return organizer && gcal_rsvp_is_user_address (addresses, i_cal_property_get_organizer (organizer));
+}
+
+/* Returns: (transfer full) (nullable): the user's ATTENDEE property of @icomp */
+static ICalProperty *
+find_user_attendee (ICalComponent *icomp,
+                    GHashTable    *addresses)
+{
+  ICalProperty *prop;
+
+  for (prop = i_cal_component_get_first_property (icomp, I_CAL_ATTENDEE_PROPERTY);
+       prop;
+       g_object_unref (prop), prop = i_cal_component_get_next_property (icomp, I_CAL_ATTENDEE_PROPERTY))
+    {
+      if (gcal_rsvp_is_user_address (addresses, i_cal_property_get_attendee (prop)))
+        return prop;
+    }
+
+  return NULL;
+}
+
+static GcalEventAttendeePartStat
+partstat_from_ical (ICalProperty *attendee)
+{
+  g_autoptr (ICalParameter) param = NULL;
+
+  param = i_cal_property_get_first_parameter (attendee, I_CAL_PARTSTAT_PARAMETER);
+  if (!param)
+    return GCAL_EVENT_ATTENDEE_PART_NEEDS_ACTION;
+
+  switch (i_cal_parameter_get_partstat (param))
+    {
+    case I_CAL_PARTSTAT_ACCEPTED:
+      return GCAL_EVENT_ATTENDEE_PART_ACCEPTED;
+
+    case I_CAL_PARTSTAT_DECLINED:
+      return GCAL_EVENT_ATTENDEE_PART_DECLINED;
+
+    case I_CAL_PARTSTAT_TENTATIVE:
+      return GCAL_EVENT_ATTENDEE_PART_TENTATIVE;
+
+    case I_CAL_PARTSTAT_DELEGATED:
+      return GCAL_EVENT_ATTENDEE_PART_DELEGATED;
+
+    case I_CAL_PARTSTAT_NEEDSACTION:
+    default:
+      return GCAL_EVENT_ATTENDEE_PART_NEEDS_ACTION;
+    }
+}
+
+static gboolean
+rsvp_requested (ICalProperty *attendee)
+{
+  g_autoptr (ICalParameter) param = NULL;
+
+  param = i_cal_property_get_first_parameter (attendee, I_CAL_RSVP_PARAMETER);
+
+  return param && i_cal_parameter_get_rsvp (param) == I_CAL_RSVP_TRUE;
+}
+
+static void
+add_timezones (ECalClient    *client,
+               ICalComponent *vcalendar,
+               ICalComponent *icomp,
+               GCancellable  *cancellable)
+{
+  static const ICalPropertyKind kinds[] = {
+    I_CAL_DTSTART_PROPERTY,
+    I_CAL_DTEND_PROPERTY,
+    I_CAL_RECURRENCEID_PROPERTY,
+  };
+  g_autoptr (GHashTable) seen = NULL;
+
+  seen = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+  for (gsize i = 0; i < G_N_ELEMENTS (kinds); i++)
+    {
+      g_autoptr (ICalProperty) prop = NULL;
+      g_autoptr (ICalComponent) tz_comp = NULL;
+      g_autoptr (GError) error = NULL;
+      g_autofree gchar *tzid = NULL;
+      ICalTimezone *zone = NULL;
+
+      prop = i_cal_component_get_first_property (icomp, kinds[i]);
+      if (!prop)
+        continue;
+
+      tzid = i_cal_property_get_parameter_as_string (prop, "TZID");
+      if (!tzid || g_hash_table_contains (seen, tzid))
+        continue;
+
+      g_hash_table_add (seen, g_strdup (tzid));
+
+      if (!e_cal_client_get_timezone_sync (client, tzid, &zone, cancellable, &error) || !zone)
+        {
+          g_debug ("No VTIMEZONE for '%s': %s", tzid, error ? error->message : "not found");
+          continue;
+        }
+
+      tz_comp = i_cal_timezone_get_component (zone);
+      if (tz_comp)
+        i_cal_component_take_component (vcalendar, i_cal_component_clone (tz_comp));
+    }
+}
+
+static void
+strip_recurrence (ICalComponent *icomp)
+{
+  e_cal_util_component_remove_property_by_kind (icomp, I_CAL_RRULE_PROPERTY, TRUE);
+  e_cal_util_component_remove_property_by_kind (icomp, I_CAL_RDATE_PROPERTY, TRUE);
+  e_cal_util_component_remove_property_by_kind (icomp, I_CAL_EXRULE_PROPERTY, TRUE);
+  e_cal_util_component_remove_property_by_kind (icomp, I_CAL_EXDATE_PROPERTY, TRUE);
+}
+
+static void
+respond_thread (GTask        *task,
+                gpointer      source_object,
+                gpointer      task_data,
+                GCancellable *cancellable)
+{
+  g_autoptr (ICalComponent) vcalendar = NULL;
+  g_autoptr (ICalComponent) target = NULL;
+  g_autoptr (ICalProperty) attendee = NULL;
+  g_autoptr (GError) error = NULL;
+  RespondData *data = task_data;
+  ECalClient *client;
+  guint32 flags;
+
+  client = gcal_calendar_get_client (data->calendar);
+
+  if (data->whole_series && e_cal_util_component_has_property (data->icomp, I_CAL_RECURRENCEID_PROPERTY))
+    {
+      /* Respond on the series: fetch the master component */
+      if (!e_cal_client_get_object_sync (client,
+                                         i_cal_component_get_uid (data->icomp),
+                                         NULL,
+                                         &target,
+                                         cancellable,
+                                         &error))
+        {
+          g_task_return_error (task, g_steal_pointer (&error));
+          return;
+        }
+    }
+  else
+    {
+      target = i_cal_component_clone (data->icomp);
+
+      /* A single occurrence: keep RECURRENCE-ID, drop the series rules */
+      if (e_cal_util_component_has_property (target, I_CAL_RECURRENCEID_PROPERTY))
+        strip_recurrence (target);
+    }
+
+  attendee = find_user_attendee (target, data->user_addresses);
+  if (!attendee)
+    {
+      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
+                               "You are not among the attendees of this event");
+      return;
+    }
+
+  i_cal_property_remove_parameter_by_kind (attendee, I_CAL_PARTSTAT_PARAMETER);
+  i_cal_property_take_parameter (attendee, i_cal_parameter_new_partstat (data->partstat));
+
+  vcalendar = e_cal_util_new_top_level ();
+  i_cal_component_set_method (vcalendar, I_CAL_METHOD_REQUEST);
+  add_timezones (client, vcalendar, target, cancellable);
+  i_cal_component_take_component (vcalendar, g_steal_pointer (&target));
+
+  flags = E_CAL_OPERATION_FLAG_NONE;
+  if (!data->notify_organizer)
+    flags |= E_CAL_OPERATION_FLAG_DISABLE_ITIP_MESSAGE;
+
+  g_debug ("Sending reply: %s", i_cal_component_as_ical_string (vcalendar));
+
+  if (!e_cal_client_receive_objects_sync (client, vcalendar, flags, cancellable, &error))
+    {
+      g_task_return_error (task, g_steal_pointer (&error));
+      return;
+    }
+
+  g_task_return_boolean (task, TRUE);
+}
+
+
+/*
+ * Public API
+ */
+
+/**
+ * gcal_rsvp_get_user_status:
+ * @manager: a #GcalManager
+ * @event: a #GcalEvent
+ * @out_status: (out) (optional): the user's current participation status
+ * @out_rsvp_requested: (out) (optional): whether the organizer asked for a reply
+ *
+ * Returns: %TRUE if the user is an attendee of @event but not its organizer,
+ * i.e. if the user can reply to it.
+ */
+gboolean
+gcal_rsvp_get_user_status (GcalManager               *manager,
+                           GcalEvent                 *event,
+                           GcalEventAttendeePartStat *out_status,
+                           gboolean                  *out_rsvp_requested)
+{
+  g_autoptr (GHashTable) addresses = NULL;
+  g_autoptr (ICalProperty) attendee = NULL;
+  ICalComponent *icomp;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), FALSE);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), FALSE);
+
+  if (!gcal_event_get_calendar (event))
+    return FALSE;
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+  addresses = gcal_rsvp_dup_user_addresses (manager, gcal_event_get_calendar (event));
+
+  if (user_is_organizer (icomp, addresses))
+    return FALSE;
+
+  attendee = find_user_attendee (icomp, addresses);
+  if (!attendee)
+    return FALSE;
+
+  if (out_status)
+    *out_status = partstat_from_ical (attendee);
+  if (out_rsvp_requested)
+    *out_rsvp_requested = rsvp_requested (attendee);
+
+  return TRUE;
+}
+
+/**
+ * gcal_rsvp_respond:
+ * @manager: a #GcalManager
+ * @event: a #GcalEvent the user is invited to
+ * @status: %GCAL_EVENT_ATTENDEE_PART_ACCEPTED, _TENTATIVE or _DECLINED
+ * @whole_series: for an occurrence of a recurring event, respond to the
+ *   whole series instead of this occurrence only
+ * @notify_organizer: whether the backend may send the reply to the organizer
+ * @cancellable: (nullable): a #GCancellable
+ * @callback: callback to call when done
+ * @user_data: data for @callback
+ *
+ * Replies to a meeting invitation through the calendar backend.
+ */
+void
+gcal_rsvp_respond (GcalManager               *manager,
+                   GcalEvent                 *event,
+                   GcalEventAttendeePartStat  status,
+                   gboolean                   whole_series,
+                   gboolean                   notify_organizer,
+                   GCancellable              *cancellable,
+                   GAsyncReadyCallback        callback,
+                   gpointer                   user_data)
+{
+  g_autoptr (GTask) task = NULL;
+  RespondData *data;
+
+  g_return_if_fail (GCAL_IS_MANAGER (manager));
+  g_return_if_fail (GCAL_IS_EVENT (event));
+  g_return_if_fail (status == GCAL_EVENT_ATTENDEE_PART_ACCEPTED ||
+                    status == GCAL_EVENT_ATTENDEE_PART_TENTATIVE ||
+                    status == GCAL_EVENT_ATTENDEE_PART_DECLINED);
+
+  data = g_new0 (RespondData, 1);
+  data->calendar = g_object_ref (gcal_event_get_calendar (event));
+  data->icomp = i_cal_component_clone (e_cal_component_get_icalcomponent (gcal_event_get_component (event)));
+  data->user_addresses = gcal_rsvp_dup_user_addresses (manager, data->calendar);
+  data->whole_series = whole_series;
+  data->notify_organizer = notify_organizer;
+
+  switch (status)
+    {
+    case GCAL_EVENT_ATTENDEE_PART_ACCEPTED:
+      data->partstat = I_CAL_PARTSTAT_ACCEPTED;
+      break;
+
+    case GCAL_EVENT_ATTENDEE_PART_TENTATIVE:
+      data->partstat = I_CAL_PARTSTAT_TENTATIVE;
+      break;
+
+    case GCAL_EVENT_ATTENDEE_PART_DECLINED:
+    default:
+      data->partstat = I_CAL_PARTSTAT_DECLINED;
+      break;
+    }
+
+  task = g_task_new (manager, cancellable, callback, user_data);
+  g_task_set_source_tag (task, gcal_rsvp_respond);
+  g_task_set_task_data (task, data, (GDestroyNotify) respond_data_free);
+  g_task_run_in_thread (task, respond_thread);
+}
+
+/**
+ * gcal_rsvp_dup_event_with_user_status:
+ * @manager: a #GcalManager
+ * @event: a #GcalEvent
+ * @status: the user's new participation status
+ *
+ * Builds a copy of @event where the user's ATTENDEE carries @status, so the UI
+ * can show a reply before the backend sends the updated event back.
+ *
+ * Returns: (transfer full) (nullable): a new #GcalEvent
+ */
+GcalEvent *
+gcal_rsvp_dup_event_with_user_status (GcalManager               *manager,
+                                      GcalEvent                 *event,
+                                      GcalEventAttendeePartStat  status)
+{
+  g_autoptr (GHashTable) addresses = NULL;
+  g_autoptr (ICalProperty) attendee = NULL;
+  g_autoptr (ECalComponent) component = NULL;
+  g_autoptr (GError) error = NULL;
+  ICalParameterPartstat partstat;
+  ICalComponent *icomp;
+  GcalEvent *copy;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), NULL);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), NULL);
+
+  switch (status)
+    {
+    case GCAL_EVENT_ATTENDEE_PART_ACCEPTED:
+      partstat = I_CAL_PARTSTAT_ACCEPTED;
+      break;
+
+    case GCAL_EVENT_ATTENDEE_PART_TENTATIVE:
+      partstat = I_CAL_PARTSTAT_TENTATIVE;
+      break;
+
+    case GCAL_EVENT_ATTENDEE_PART_DECLINED:
+      partstat = I_CAL_PARTSTAT_DECLINED;
+      break;
+
+    default:
+      partstat = I_CAL_PARTSTAT_NEEDSACTION;
+      break;
+    }
+
+  component = e_cal_component_clone (gcal_event_get_component (event));
+  icomp = e_cal_component_get_icalcomponent (component);
+  addresses = gcal_rsvp_dup_user_addresses (manager, gcal_event_get_calendar (event));
+
+  attendee = find_user_attendee (icomp, addresses);
+  if (!attendee)
+    return NULL;
+
+  i_cal_property_remove_parameter_by_kind (attendee, I_CAL_PARTSTAT_PARAMETER);
+  i_cal_property_take_parameter (attendee, i_cal_parameter_new_partstat (partstat));
+
+  copy = gcal_event_new (gcal_event_get_calendar (event), component, &error);
+  if (error)
+    g_warning ("Could not copy event: %s", error->message);
+
+  return copy;
+}
+
+gboolean
+gcal_rsvp_respond_finish (GAsyncResult  *result,
+                          GError       **error)
+{
+  g_return_val_if_fail (G_IS_TASK (result), FALSE);
+  g_return_val_if_fail (g_task_get_source_tag (G_TASK (result)) == gcal_rsvp_respond, FALSE);
+
+  return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+
+/*
+ * Editing guests (fork phase 3)
+ *
+ * The event editor edits a copy of the event in place; these helpers change
+ * its ORGANIZER / ATTENDEE properties and reload the GcalEvent's attendee
+ * model. Saving then goes through the normal create/modify path: when the
+ * user is the organizer, evolution-ews saves with SendToAllAndSaveCopy, so
+ * Exchange sends the invitations and updates itself.
+ */
+
+static gchar *
+dup_user_name (GcalManager *manager,
+               const gchar *address)
+{
+  g_autolist (ESource) identities = NULL;
+  ESourceRegistry *registry;
+
+  registry = gcal_manager_get_source_registry (manager);
+  if (!registry || !address)
+    return NULL;
+
+  identities = e_source_registry_list_enabled (registry, E_SOURCE_EXTENSION_MAIL_IDENTITY);
+
+  for (GList *l = identities; l; l = l->next)
+    {
+      ESourceMailIdentity *identity = e_source_get_extension (l->data, E_SOURCE_EXTENSION_MAIL_IDENTITY);
+
+      if (g_ascii_strcasecmp (e_source_mail_identity_get_address (identity) ?: "", address) == 0)
+        return e_source_mail_identity_dup_name (identity);
+    }
+
+  return NULL;
+}
+
+static guint
+count_attendees (ICalComponent *icomp)
+{
+  return i_cal_component_count_properties (icomp, I_CAL_ATTENDEE_PROPERTY);
+}
+
+/**
+ * gcal_rsvp_can_edit_guests:
+ * @manager: a #GcalManager
+ * @event: a #GcalEvent
+ *
+ * Returns: %TRUE if the guests of @event can be changed: the calendar is
+ * writable, has an account address to send invitations from, and the event
+ * has no organizer yet, or the user organizes it.
+ */
+gboolean
+gcal_rsvp_can_edit_guests (GcalManager *manager,
+                           GcalEvent   *event)
+{
+  g_autoptr (GHashTable) addresses = NULL;
+  GcalCalendar *calendar;
+  ICalComponent *icomp;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), FALSE);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), FALSE);
+
+  calendar = gcal_event_get_calendar (event);
+  if (!calendar || gcal_calendar_is_read_only (calendar))
+    return FALSE;
+
+  /* Only calendars with an account address (e.g. Exchange) can send invitations */
+  if (!gcal_calendar_get_user_email (calendar) || !*gcal_calendar_get_user_email (calendar))
+    return FALSE;
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+  if (!e_cal_util_component_has_organizer (icomp))
+    return TRUE;
+
+  addresses = gcal_rsvp_dup_user_addresses (manager, calendar);
+
+  return user_is_organizer (icomp, addresses);
+}
+
+/**
+ * gcal_rsvp_add_guest:
+ * @manager: a #GcalManager
+ * @event: the edited #GcalEvent
+ * @address: the guest's email address
+ * @name: (nullable): the guest's display name
+ *
+ * Adds a required attendee to @event, making the user its organizer if it has
+ * none yet.
+ *
+ * Returns: %TRUE if the guest was added, %FALSE if already invited
+ */
+gboolean
+gcal_rsvp_add_guest (GcalManager *manager,
+                     GcalEvent   *event,
+                     const gchar *address,
+                     const gchar *name)
+{
+  g_autoptr (GHashTable) guest = NULL;
+  g_autoptr (ICalProperty) existing = NULL;
+  g_autofree gchar *mailto = NULL;
+  ICalComponent *icomp;
+  ICalProperty *prop;
+
+  g_return_val_if_fail (GCAL_IS_MANAGER (manager), FALSE);
+  g_return_val_if_fail (GCAL_IS_EVENT (event), FALSE);
+  g_return_val_if_fail (address && *address, FALSE);
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+
+  guest = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_hash_table_add (guest, g_ascii_strdown (address, -1));
+
+  existing = find_user_attendee (icomp, guest);
+  if (existing)
+    return FALSE;
+
+  if (!e_cal_util_component_has_organizer (icomp))
+    {
+      const gchar *user_email = gcal_calendar_get_user_email (gcal_event_get_calendar (event));
+      g_autofree gchar *user_name = NULL;
+      g_autofree gchar *organizer_mailto = NULL;
+
+      if (user_email && *user_email)
+        {
+          user_name = dup_user_name (manager, user_email);
+          organizer_mailto = g_strconcat ("mailto:", user_email, NULL);
+
+          prop = i_cal_property_new_organizer (organizer_mailto);
+          if (user_name && *user_name)
+            i_cal_property_take_parameter (prop, i_cal_parameter_new_cn (user_name));
+          i_cal_component_take_property (icomp, prop);
+        }
+      else
+        {
+          g_warning ("Calendar has no user address; the backend will pick the organizer");
+        }
+    }
+
+  mailto = g_strconcat ("mailto:", address, NULL);
+  prop = i_cal_property_new_attendee (mailto);
+  if (name && *name)
+    i_cal_property_take_parameter (prop, i_cal_parameter_new_cn (name));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_cutype (I_CAL_CUTYPE_INDIVIDUAL));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_role (I_CAL_ROLE_REQPARTICIPANT));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_partstat (I_CAL_PARTSTAT_NEEDSACTION));
+  i_cal_property_take_parameter (prop, i_cal_parameter_new_rsvp (I_CAL_RSVP_TRUE));
+  i_cal_component_take_property (icomp, prop);
+
+  gcal_event_reload_attendees (event);
+
+  return TRUE;
+}
+
+/**
+ * gcal_rsvp_remove_guest:
+ * @manager: a #GcalManager
+ * @event: the edited #GcalEvent
+ * @address: the guest's email address
+ *
+ * Removes an attendee from @event. When the last attendee goes, the
+ * organizer goes too, turning the meeting back into a plain event.
+ */
+void
+gcal_rsvp_remove_guest (GcalManager *manager,
+                        GcalEvent   *event,
+                        const gchar *address)
+{
+  g_autoptr (GHashTable) guest = NULL;
+  g_autoptr (ICalProperty) attendee = NULL;
+  ICalComponent *icomp;
+
+  g_return_if_fail (GCAL_IS_MANAGER (manager));
+  g_return_if_fail (GCAL_IS_EVENT (event));
+  g_return_if_fail (address && *address);
+
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+
+  guest = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  g_hash_table_add (guest, g_ascii_strdown (address, -1));
+
+  attendee = find_user_attendee (icomp, guest);
+  if (!attendee)
+    return;
+
+  i_cal_component_remove_property (icomp, attendee);
+
+  if (count_attendees (icomp) == 0)
+    e_cal_util_component_remove_property_by_kind (icomp, I_CAL_ORGANIZER_PROPERTY, TRUE);
+
+  gcal_event_reload_attendees (event);
+}
+
+static GHashTable *
+dup_guest_set (GcalEvent *event)
+{
+  ICalComponent *icomp;
+  ICalProperty *prop;
+  GHashTable *set;
+
+  set = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  icomp = e_cal_component_get_icalcomponent (gcal_event_get_component (event));
+
+  for (prop = i_cal_component_get_first_property (icomp, I_CAL_ATTENDEE_PROPERTY);
+       prop;
+       g_object_unref (prop), prop = i_cal_component_get_next_property (icomp, I_CAL_ATTENDEE_PROPERTY))
+    {
+      const gchar *address = e_cal_util_strip_mailto (i_cal_property_get_attendee (prop));
+
+      if (address)
+        g_hash_table_add (set, g_ascii_strdown (address, -1));
+    }
+
+  return set;
+}
+
+/**
+ * gcal_rsvp_guests_equal:
+ * @event1: a #GcalEvent
+ * @event2: a #GcalEvent
+ *
+ * Returns: %TRUE if both events invite the same addresses
+ */
+gboolean
+gcal_rsvp_guests_equal (GcalEvent *event1,
+                        GcalEvent *event2)
+{
+  g_autoptr (GHashTable) set1 = NULL;
+  g_autoptr (GHashTable) set2 = NULL;
+  GHashTableIter iter;
+  gpointer key;
+
+  g_return_val_if_fail (GCAL_IS_EVENT (event1) && GCAL_IS_EVENT (event2), TRUE);
+
+  set1 = dup_guest_set (event1);
+  set2 = dup_guest_set (event2);
+
+  if (g_hash_table_size (set1) != g_hash_table_size (set2))
+    return FALSE;
+
+  g_hash_table_iter_init (&iter, set1);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      if (!g_hash_table_contains (set2, key))
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+/**
+ * gcal_rsvp_count_guest_changes:
+ * @original: the event as it was
+ * @edited: the edited event
+ * @out_added: (out): guests only in @edited
+ * @out_removed: (out): guests only in @original
+ * @out_kept: (out): guests in both
+ *
+ * Counts how the guests changed, to tell the user who will get an email.
+ */
+void
+gcal_rsvp_count_guest_changes (GcalEvent *original,
+                               GcalEvent *edited,
+                               guint     *out_added,
+                               guint     *out_removed,
+                               guint     *out_kept)
+{
+  g_autoptr (GHashTable) before = NULL;
+  g_autoptr (GHashTable) after = NULL;
+  guint added = 0, removed = 0, kept = 0;
+  GHashTableIter iter;
+  gpointer key;
+
+  g_return_if_fail (GCAL_IS_EVENT (edited));
+
+  before = original ? dup_guest_set (original) : g_hash_table_new (g_str_hash, g_str_equal);
+  after = dup_guest_set (edited);
+
+  g_hash_table_iter_init (&iter, after);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      if (g_hash_table_contains (before, key))
+        kept++;
+      else
+        added++;
+    }
+
+  g_hash_table_iter_init (&iter, before);
+  while (g_hash_table_iter_next (&iter, &key, NULL))
+    {
+      if (!g_hash_table_contains (after, key))
+        removed++;
+    }
+
+  if (out_added)
+    *out_added = added;
+  if (out_removed)
+    *out_removed = removed;
+  if (out_kept)
+    *out_kept = kept;
+}
+
+/**
+ * gcal_rsvp_copy_guests:
+ * @from: a #GcalEvent
+ * @to: a #GcalEvent
+ *
+ * Replaces the ORGANIZER and ATTENDEE properties of @to with those of @from,
+ * e.g. when applying an edited occurrence to the whole series.
+ */
+void
+gcal_rsvp_copy_guests (GcalEvent *from,
+                       GcalEvent *to)
+{
+  ICalComponent *source;
+  ICalComponent *target;
+  ICalProperty *prop;
+
+  g_return_if_fail (GCAL_IS_EVENT (from) && GCAL_IS_EVENT (to));
+
+  source = e_cal_component_get_icalcomponent (gcal_event_get_component (from));
+  target = e_cal_component_get_icalcomponent (gcal_event_get_component (to));
+
+  e_cal_util_component_remove_property_by_kind (target, I_CAL_ORGANIZER_PROPERTY, TRUE);
+  e_cal_util_component_remove_property_by_kind (target, I_CAL_ATTENDEE_PROPERTY, TRUE);
+
+  prop = i_cal_component_get_first_property (source, I_CAL_ORGANIZER_PROPERTY);
+  if (prop)
+    {
+      i_cal_component_take_property (target, i_cal_property_clone (prop));
+      g_object_unref (prop);
+    }
+
+  for (prop = i_cal_component_get_first_property (source, I_CAL_ATTENDEE_PROPERTY);
+       prop;
+       g_object_unref (prop), prop = i_cal_component_get_next_property (source, I_CAL_ATTENDEE_PROPERTY))
+    {
+      i_cal_component_take_property (target, i_cal_property_clone (prop));
+    }
+
+  gcal_event_reload_attendees (to);
+}
