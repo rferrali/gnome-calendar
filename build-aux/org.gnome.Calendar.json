@@ -22,7 +22,13 @@
         "--talk-name=org.gnome.evolution.dataserver.Sources5",
         "--talk-name=org.gnome.evolution.dataserver.Subprocess.Backend.*",
         "--talk-name=org.gnome.OnlineAccounts",
-        "--talk-name=org.gnome.SettingsDaemon.Color"
+        "--talk-name=org.gnome.SettingsDaemon.Color",
+        "--filesystem=xdg-run/dconf",
+        "--filesystem=~/.config/dconf:ro",
+        "--talk-name=ca.desrt.dconf",
+        "--env=DCONF_USER_CONFIG_DIR=.config/dconf",
+        "--env=GIO_EXTRA_MODULES=/app/lib/gio/modules",
+        "--env=GSETTINGS_BACKEND=keyfile"
     ],
     "cleanup" : [
         "/include",
@@ -144,6 +150,32 @@
                 {
                     "type" : "git",
                     "url" : "https://gitlab.gnome.org/GNOME/evolution-data-server.git"
+                }
+            ]
+        },
+        {
+            "name" : "dconf",
+            "buildsystem" : "meson",
+            "config-opts" : [
+                "-Dbash_completion=false",
+                "-Dman=false",
+                "-Dvapi=false"
+            ],
+            "cleanup" : [
+                "/bin",
+                "/libexec",
+                "/share/dbus-1",
+                "/lib/systemd"
+            ],
+            "sources" : [
+                {
+                    "type" : "archive",
+                    "url" : "https://download.gnome.org/sources/dconf/51/dconf-51.0.tar.xz",
+                    "sha256" : "e65c1b7867f836faad9f9ee04acf5c5a6cae2bbc784833fe093207e0cb590248"
+                },
+                {
+                    "type" : "patch",
+                    "path" : "../build-aux/dconf-user-config-dir.patch"
                 }
             ]
         },

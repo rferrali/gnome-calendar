@@ -77,6 +77,24 @@ template $GcalEditCalendarPage: Adw.NavigationPage {
         }
       }
 
+      /* Fork: EDS default reminder, shown by GNOME Shell */
+      Adw.PreferencesGroup reminders_group {
+        title: _("Reminders");
+
+        Adw.SwitchRow remind_every_event_row {
+          title: _("_Remind Before Every Event");
+          use-underline: true;
+          notify::active => $on_remind_every_event_changed_cb(template) not-swapped;
+        }
+
+        Adw.ComboRow reminder_time_row {
+          title: _("Reminder _Time");
+          use-underline: true;
+          visible: bind remind_every_event_row.active;
+          notify::selected => $on_reminder_time_changed_cb(template) not-swapped;
+        }
+      }
+
       Adw.PreferencesGroup {
         Adw.ButtonRow {
           title: _("_Export Calendar");

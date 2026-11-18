@@ -1,0 +1,45 @@
+Subject: engine: Read the user database from DCONF_USER_CONFIG_DIR
+
+Fork: lets the Flatpak read the host user database, as the GNOME runtime
+used to patch dconf to do.
+---
+--- a/engine/dconf-engine-source-user.c
++++ b/engine/dconf-engine-source-user.c
+@@ -34,16 +34,36 @@
+   guint8 *shm;
+ } DConfEngineSourceUser;
+ 
++/* DCONF_USER_CONFIG_DIR, absolute or relative to the home directory,
++ * lets a sandboxed app read the host's user database.
++ */
++static gchar *
++dconf_engine_source_user_get_dir (void)
++{
++  const gchar *dir = g_getenv ("DCONF_USER_CONFIG_DIR");
++
++  if (dir == NULL || *dir == '\0')
++    return g_build_filename (g_get_user_config_dir (), "dconf", NULL);
++
++  if (g_path_is_absolute (dir))
++    return g_strdup (dir);
++
++  return g_build_filename (g_get_home_dir (), dir, NULL);
++}
++
+ static GvdbTable *
+ dconf_engine_source_user_open_gvdb (const gchar *name)
+ {
+   GvdbTable *table;
+   gchar *filename;
++  gchar *dir;
+ 
+   /* This can fail in the normal case of the user not having any
+    * settings.  That's OK and it shouldn't be considered as an error.
+    */
+-  filename = g_build_filename (g_get_user_config_dir (), "dconf", name, NULL);
++  dir = dconf_engine_source_user_get_dir ();
++  filename = g_build_filename (dir, name, NULL);
++  g_free (dir);
+   table = gvdb_table_new (filename, FALSE, NULL);
+   g_free (filename);
+ 

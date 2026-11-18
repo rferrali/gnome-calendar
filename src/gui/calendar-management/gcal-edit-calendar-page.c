@@ -20,6 +20,11 @@
 
 #define G_LOG_DOMAIN "GcalEditCalendarPage"
 
+/* Fork: GETTEXT_PACKAGE, and the dconf backend for the EDS calendar settings */
+#include "config.h"
+#define G_SETTINGS_ENABLE_BACKEND
+#include <gio/gsettingsbackend.h>
+
 #include "gcal-context.h"
 #include "gcal-calendar-management-page.h"
 #include "gcal-debug.h"
@@ -39,6 +44,14 @@ struct _GcalEditCalendarPage
   AdwEntryRow        *name_entry;
   GtkWidget          *remove_button_row;
 
+  /* Fork: default reminders */
+  GtkWidget          *reminders_group;
+  AdwSwitchRow       *remind_every_event_row;
+  AdwComboRow        *reminder_time_row;
+  GSettings          *eds_calendar_settings;
+  GArray             *reminder_times;
+  guint               applied_reminder_time;
+
   GcalCalendar       *calendar;
 };
 
@@ -48,6 +61,294 @@ G_DEFINE_TYPE_WITH_CODE (GcalEditCalendarPage, gcal_edit_calendar_page, ADW_TYPE
                          G_IMPLEMENT_INTERFACE (GCAL_TYPE_CALENDAR_MANAGEMENT_PAGE,
                                                 gcal_calendar_management_page_iface_init))
 
+static void          on_remind_every_event_changed_cb            (AdwSwitchRow         *row,
+                                                                  GParamSpec           *pspec,
+                                                                  GcalEditCalendarPage *self);
+
+static void          on_reminder_time_changed_cb                 (AdwComboRow          *row,
+                                                                  GParamSpec           *pspec,
+                                                                  GcalEditCalendarPage *self);
+
+
+/*
+ * Fork: default reminders
+ *
+ * GNOME Shell reminds before every event of a calendar when both the global
+ * defall-reminder-enabled key of the EDS calendar schema and the calendar's
+ * ESourceAlarms:for-every-event are on. The reminder time is global too.
+ */
+
+#define EDS_CALENDAR_SCHEMA "org.gnome.evolution-data-server.calendar"
+
+typedef enum
+{
+  REMINDER_UNIT_MINUTES,
+  REMINDER_UNIT_HOURS,
+  REMINDER_UNIT_DAYS,
+} ReminderUnit;
+
+typedef struct
+{
+  gint         interval;
+  ReminderUnit unit;
+} ReminderTime;
+
+static const ReminderTime reminder_time_presets[] = {
+  { 5, REMINDER_UNIT_MINUTES },
+  { 10, REMINDER_UNIT_MINUTES },
+  { 15, REMINDER_UNIT_MINUTES },
+  { 30, REMINDER_UNIT_MINUTES },
+  { 1, REMINDER_UNIT_HOURS },
+  { 1, REMINDER_UNIT_DAYS },
+};
+
+/*
+ * Other apps (GNOME Shell, Evolution) read the EDS keys from dconf. In the
+ * Flatpak, the app's own settings live in a keyfile (GSETTINGS_BACKEND), so
+ * this schema alone goes through the bundled dconf module.
+ */
+static GSettings *
+create_eds_calendar_settings (void)
+{
+  g_autoptr (GSettingsBackend) backend = NULL;
+  g_autoptr (GSettingsSchema) schema = NULL;
+  GSettingsSchemaSource *schema_source;
+  GIOExtensionPoint *extension_point;
+  GIOExtension *extension;
+
+  schema_source = g_settings_schema_source_get_default ();
+  if (!schema_source)
+    return NULL;
+
+  schema = g_settings_schema_source_lookup (schema_source, EDS_CALENDAR_SCHEMA, TRUE);
+  if (!schema ||
+      !g_settings_schema_has_key (schema, "defall-reminder-enabled") ||
+      !g_settings_schema_has_key (schema, "defall-reminder-interval") ||
+      !g_settings_schema_has_key (schema, "defall-reminder-units"))
+    {
+      g_debug ("No default reminder keys in the %s schema", EDS_CALENDAR_SCHEMA);
+      return NULL;
+    }
+
+  /* Loads the GIO modules, so the dconf extension is registered */
+  g_object_unref (g_settings_backend_get_default ());
+
+  extension_point = g_io_extension_point_lookup (G_SETTINGS_BACKEND_EXTENSION_POINT_NAME);
+  extension = extension_point ? g_io_extension_point_get_extension_by_name (extension_point, "dconf") : NULL;
+  if (!extension)
+    {
+      g_debug ("No dconf settings backend, hiding the default reminder settings");
+      return NULL;
+    }
+
+  backend = g_object_new (g_io_extension_get_type (extension), NULL);
+
+  return g_settings_new_full (schema, backend, NULL);
+}
+
+static gchar *
+format_reminder_time (const ReminderTime *time)
+{
+  switch (time->unit)
+    {
+    case REMINDER_UNIT_MINUTES:
+      return g_strdup_printf (g_dngettext (GETTEXT_PACKAGE, "%d minute", "%d minutes", time->interval), time->interval);
+
+    case REMINDER_UNIT_HOURS:
+      return g_strdup_printf (g_dngettext (GETTEXT_PACKAGE, "%d hour", "%d hours", time->interval), time->interval);
+
+    case REMINDER_UNIT_DAYS:
+      return g_strdup_printf (g_dngettext (GETTEXT_PACKAGE, "%d day", "%d days", time->interval), time->interval);
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+/* The presets, plus the current time if it was set elsewhere (Evolution, gsettings) */
+static void
+setup_reminder_times (GcalEditCalendarPage *self)
+{
+  g_autoptr (GtkStringList) model = NULL;
+  ReminderTime current;
+  guint selected = GTK_INVALID_LIST_POSITION;
+
+  current.interval = g_settings_get_int (self->eds_calendar_settings, "defall-reminder-interval");
+  current.unit = g_settings_get_enum (self->eds_calendar_settings, "defall-reminder-units");
+
+  g_array_set_size (self->reminder_times, 0);
+  g_array_append_vals (self->reminder_times, reminder_time_presets, G_N_ELEMENTS (reminder_time_presets));
+
+  for (guint i = 0; i < self->reminder_times->len; i++)
+    {
+      const ReminderTime *time = &g_array_index (self->reminder_times, ReminderTime, i);
+
+      if (time->interval == current.interval && time->unit == current.unit)
+        selected = i;
+    }
+
+  if (selected == GTK_INVALID_LIST_POSITION)
+    {
+      g_array_append_val (self->reminder_times, current);
+      selected = self->reminder_times->len - 1;
+    }
+
+  model = gtk_string_list_new (NULL);
+  for (guint i = 0; i < self->reminder_times->len; i++)
+    {
+      g_autofree gchar *label = format_reminder_time (&g_array_index (self->reminder_times, ReminderTime, i));
+
+      gtk_string_list_append (model, label);
+    }
+
+  g_signal_handlers_block_by_func (self->reminder_time_row, on_reminder_time_changed_cb, self);
+  adw_combo_row_set_model (self->reminder_time_row, G_LIST_MODEL (model));
+  adw_combo_row_set_selected (self->reminder_time_row, selected);
+  self->applied_reminder_time = selected;
+  g_signal_handlers_unblock_by_func (self->reminder_time_row, on_reminder_time_changed_cb, self);
+}
+
+static gboolean
+source_reminds_every_event (ESource *source)
+{
+  if (!e_source_has_extension (source, E_SOURCE_EXTENSION_ALARMS))
+    return FALSE;
+
+  return e_source_alarms_get_for_every_event (e_source_get_extension (source, E_SOURCE_EXTENSION_ALARMS));
+}
+
+/* The global switch is on exactly when at least one calendar uses it */
+static void
+sync_default_reminder_enabled (GcalEditCalendarPage *self)
+{
+  g_autoptr (GList) calendars = NULL;
+  GcalManager *manager;
+  gboolean any = FALSE;
+
+  manager = gcal_context_get_manager (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+  calendars = gcal_manager_get_calendars (manager);
+
+  for (GList *l = calendars; l && !any; l = l->next)
+    any = source_reminds_every_event (gcal_calendar_get_source (l->data));
+
+  g_settings_set_boolean (self->eds_calendar_settings, "defall-reminder-enabled", any);
+}
+
+static void
+setup_reminders (GcalEditCalendarPage *self,
+                 ESource              *source)
+{
+  /* Hidden only when the source itself can't be saved; read-only calendars can still remind */
+  gboolean available = self->eds_calendar_settings && e_source_get_writable (source);
+
+  gtk_widget_set_visible (self->reminders_group, available);
+
+  if (!available)
+    return;
+
+  g_signal_handlers_block_by_func (self->remind_every_event_row, on_remind_every_event_changed_cb, self);
+  adw_switch_row_set_active (self->remind_every_event_row, source_reminds_every_event (source));
+  g_signal_handlers_unblock_by_func (self->remind_every_event_row, on_remind_every_event_changed_cb, self);
+
+  setup_reminder_times (self);
+}
+
+static void
+on_remind_every_event_changed_cb (AdwSwitchRow         *row,
+                                  GParamSpec           *pspec,
+                                  GcalEditCalendarPage *self)
+{
+  ESourceAlarms *alarms;
+  GcalManager *manager;
+  ESource *source;
+
+  if (!self->calendar || !self->eds_calendar_settings)
+    return;
+
+  source = gcal_calendar_get_source (self->calendar);
+  alarms = e_source_get_extension (source, E_SOURCE_EXTENSION_ALARMS);
+  e_source_alarms_set_for_every_event (alarms, adw_switch_row_get_active (row));
+
+  manager = gcal_context_get_manager (gcal_application_get_context (GCAL_DEFAULT_APPLICATION));
+  gcal_manager_save_source (manager, source);
+
+  sync_default_reminder_enabled (self);
+}
+
+static void
+select_reminder_time (GcalEditCalendarPage *self,
+                      guint                 position)
+{
+  g_signal_handlers_block_by_func (self->reminder_time_row, on_reminder_time_changed_cb, self);
+  adw_combo_row_set_selected (self->reminder_time_row, position);
+  g_signal_handlers_unblock_by_func (self->reminder_time_row, on_reminder_time_changed_cb, self);
+}
+
+static void
+on_reminder_time_dialog_response_cb (GObject      *object,
+                                     GAsyncResult *result,
+                                     gpointer      user_data)
+{
+  g_autoptr (GcalEditCalendarPage) self = user_data;
+  const ReminderTime *time;
+  const gchar *response;
+  guint selected;
+
+  response = adw_alert_dialog_choose_finish (ADW_ALERT_DIALOG (object), result);
+  selected = adw_combo_row_get_selected (self->reminder_time_row);
+
+  if (g_strcmp0 (response, "change") != 0 || selected >= self->reminder_times->len)
+    {
+      select_reminder_time (self, self->applied_reminder_time);
+      return;
+    }
+
+  time = &g_array_index (self->reminder_times, ReminderTime, selected);
+
+  g_settings_set_int (self->eds_calendar_settings, "defall-reminder-interval", time->interval);
+  g_settings_set_enum (self->eds_calendar_settings, "defall-reminder-units", time->unit);
+
+  self->applied_reminder_time = selected;
+}
+
+/* The time is global in EDS, so changing it from one calendar asks first */
+static void
+on_reminder_time_changed_cb (AdwComboRow          *row,
+                             GParamSpec           *pspec,
+                             GcalEditCalendarPage *self)
+{
+  g_autofree gchar *time_label = NULL;
+  AdwDialog *dialog;
+  guint selected;
+
+  if (!self->eds_calendar_settings)
+    return;
+
+  selected = adw_combo_row_get_selected (row);
+  if (selected >= self->reminder_times->len || selected == self->applied_reminder_time)
+    return;
+
+  time_label = format_reminder_time (&g_array_index (self->reminder_times, ReminderTime, selected));
+
+  dialog = adw_alert_dialog_new (_("Change Reminder Time for All Calendars?"), NULL);
+  adw_alert_dialog_format_body (ADW_ALERT_DIALOG (dialog),
+                                _("Every calendar that reminds before every event will remind you %s before each event."),
+                                time_label);
+
+  adw_alert_dialog_add_responses (ADW_ALERT_DIALOG (dialog),
+                                  "cancel", _("_Cancel"),
+                                  "change", _("C_hange"),
+                                  NULL);
+  adw_alert_dialog_set_response_appearance (ADW_ALERT_DIALOG (dialog), "change", ADW_RESPONSE_SUGGESTED);
+  adw_alert_dialog_set_default_response (ADW_ALERT_DIALOG (dialog), "cancel");
+  adw_alert_dialog_set_close_response (ADW_ALERT_DIALOG (dialog), "cancel");
+
+  adw_alert_dialog_choose (ADW_ALERT_DIALOG (dialog),
+                           GTK_WIDGET (self),
+                           NULL,
+                           on_reminder_time_dialog_response_cb,
+                           g_object_ref (self));
+}
 
 /*
  * Auxiliary methods
@@ -197,6 +498,8 @@ setup_calendar (GcalEditCalendarPage *self,
   adw_switch_row_set_active (self->calendar_visible_row, gcal_calendar_get_visible (calendar));
 
   gtk_widget_set_visible (self->remove_button_row, e_source_get_removable (source));
+
+  setup_reminders (self, source);
 }
 
 /*
@@ -458,6 +761,8 @@ gcal_edit_calendar_page_finalize (GObject *object)
   GcalEditCalendarPage *self = (GcalEditCalendarPage *)object;
 
   g_clear_object (&self->calendar);
+  g_clear_object (&self->eds_calendar_settings);
+  g_clear_pointer (&self->reminder_times, g_array_unref);
 
   G_OBJECT_CLASS (gcal_edit_calendar_page_parent_class)->finalize (object);
 }
@@ -479,16 +784,25 @@ gcal_edit_calendar_page_class_init (GcalEditCalendarPageClass *klass)
   gtk_widget_class_bind_template_child (widget_class, GcalEditCalendarPage, calendar_visible_row);
   gtk_widget_class_bind_template_child (widget_class, GcalEditCalendarPage, name_entry);
   gtk_widget_class_bind_template_child (widget_class, GcalEditCalendarPage, remove_button_row);
+  gtk_widget_class_bind_template_child (widget_class, GcalEditCalendarPage, reminders_group);
+  gtk_widget_class_bind_template_child (widget_class, GcalEditCalendarPage, remind_every_event_row);
+  gtk_widget_class_bind_template_child (widget_class, GcalEditCalendarPage, reminder_time_row);
 
   gtk_widget_class_bind_template_callback (widget_class, on_calendar_color_changed_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_calendar_visibility_changed_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_remove_button_row_activated_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_export_button_row_activated_cb);
   gtk_widget_class_bind_template_callback (widget_class, on_settings_button_clicked_cb);
+  gtk_widget_class_bind_template_callback (widget_class, on_remind_every_event_changed_cb);
+  gtk_widget_class_bind_template_callback (widget_class, on_reminder_time_changed_cb);
 }
 
 static void
 gcal_edit_calendar_page_init (GcalEditCalendarPage *self)
 {
   gtk_widget_init_template (GTK_WIDGET (self));
+
+  /* Fork: default reminders */
+  self->reminder_times = g_array_new (FALSE, FALSE, sizeof (ReminderTime));
+  self->eds_calendar_settings = create_eds_calendar_settings ();
 }
