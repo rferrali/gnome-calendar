@@ -55,6 +55,7 @@ sources += files(
   'gcal-overflow-bin-layout.c',
   'gcal-quick-add-popover.c',
   'gcal-search-button.c',
+  'gcal-suggestion-entry-row.c',
   'gcal-sync-indicator.c',
   'gcal-tests.c',
   'gcal-weather-settings.c',
